@@ -1,17 +1,5 @@
 {
   "name": "circuit-ai",
   "version-string": "1.0.0",
-  "dependencies": [
-    "eigen3",
-    "glfw3",
-    "opengl",
-    "implot",
-    {
-      "name": "imgui",
-      "features": [
-        "glfw-binding",
-        "opengl3-binding"
-      ]
-    }
-  ]
+  "dependencies": []
 }

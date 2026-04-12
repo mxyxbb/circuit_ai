@@ -1,0 +1,17 @@
+add_library(circuit_frontend STATIC
+    view_model/scope_model.cpp
+    view_model/main_view_model.cpp
+    views/main_view.cpp
+    views/scope_view.cpp
+    views/settings_view.cpp
+    views/palette_view.cpp
+    views/schematic_view.cpp
+)
+target_include_directories(circuit_frontend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(circuit_frontend
+    PUBLIC circuit_backend imgui implot glfw OpenGL::GL
+)
+target_include_directories(circuit_frontend SYSTEM PUBLIC
+    ${CMAKE_SOURCE_DIR}/external/imgui
+    ${CMAKE_SOURCE_DIR}/external/implot
+)

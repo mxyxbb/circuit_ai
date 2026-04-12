@@ -1,0 +1,7 @@
+* RL Circuit with Step Input
+V1  1  0  STEP V0=0 V1=10 tdelay=0.001
+R1  1  2  10
+L1  2  0  10m
+.TRAN 1e-6 0.01
+.PROBE V(1) V(2) I(L1)
+.END

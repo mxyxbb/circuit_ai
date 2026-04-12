@@ -1,0 +1,7 @@
+* RC Low-Pass Filter with Square Wave Input
+R1  1  2  1k
+C1  2  0  1u
+V1  1  0  SQUARE freq=1k duty=0.5 Vhigh=5 Vlow=0
+.TRAN 1e-6 0.01
+.PROBE V(1) V(2) I(R1)
+.END
