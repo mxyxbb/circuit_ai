@@ -7,7 +7,7 @@ public:
     void render(MainViewModel& vm) override;
 
 private:
-    char netlistPath_[256] = "";
+    char netlistPath_[260] = "";
     double dtInput_ = 1e-6;
     double tEndInput_ = 0.01;
 };

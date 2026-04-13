@@ -12,8 +12,8 @@ struct MuxEntry {
     bool visible = true;
     ScrollingBuffer buffer;
 
-    MuxEntry(const std::string& name, ImU32 col)
-        : signalName(name), color(col), buffer(20000) {}
+    MuxEntry(const std::string& name, ImU32 col, size_t cap = 20000)
+        : signalName(name), color(col), buffer(cap) {}
 };
 
 // A single coordinate area (one ImPlot)
@@ -30,15 +30,18 @@ struct PlotArea {
         return nullptr;
     }
 
-    void addSignal(const std::string& name, ImU32 color) {
-        if (!findEntry(name))
-            entries.push_back(std::make_unique<MuxEntry>(name, color));
+    void addSignal(const std::string& name, ImU32 color, size_t capacity = 20000) {
+        MuxEntry* e = findEntry(name);
+        if (e) {
+            e->visible = true;  // re-show hidden signal (preserves buffer data)
+        } else {
+            entries.push_back(std::make_unique<MuxEntry>(name, color, capacity));
+        }
     }
 
     void removeSignal(const std::string& name) {
-        entries.erase(std::remove_if(entries.begin(), entries.end(),
-            [&](const std::unique_ptr<MuxEntry>& e) { return e->signalName == name; }),
-            entries.end());
+        MuxEntry* e = findEntry(name);
+        if (e) e->visible = false;  // hide instead of destroy to preserve data
     }
 };
 
@@ -62,6 +65,12 @@ public:
     void clearAllBuffers();
     void autoFitAll();
 
+    // Buffer capacity management (set based on t_end/dt before populating)
+    void setBufferCapacity(size_t cap) { bufferCapacity_ = cap; }
+    size_t getBufferCapacity() const { return bufferCapacity_; }
+    // Rebuild all existing MuxEntry buffers with a new capacity (used after config changes)
+    void resizeAllBuffers(size_t newCapacity);
+
     // Find a MuxEntry across all plots by signal name (for data push)
     std::vector<MuxEntry*> findAllEntries(const std::string& name);
 
@@ -71,6 +80,7 @@ public:
 private:
     std::vector<std::unique_ptr<PlotArea>> plots_;
     int selectedPlot_ = 0;
+    size_t bufferCapacity_ = 20000;
     static int colorIndex_;
 
     std::string makePlotTitle(int index);

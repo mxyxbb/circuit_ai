@@ -45,6 +45,9 @@ int ScopeModel::insertPlot(int insertAfterIdx, const std::string& title) {
     auto newPlot = std::make_unique<PlotArea>(t);
     plots_.insert(plots_.begin() + insertAt, std::move(newPlot));
 
+    // Keep selectedPlot_ pointing at the same logical plot after index shift
+    if (selectedPlot_ >= insertAt) selectedPlot_++;
+
     // Re-number titles
     for (int i = 0; i < plotCount(); i++) {
         if (plots_[i]->title.substr(0, 5) == "Plot ")
@@ -62,7 +65,25 @@ void ScopeModel::removePlot(int index) {
 
 void ScopeModel::addSignalToPlot(int plotIdx, const std::string& name, ImU32 color) {
     PlotArea* p = getPlot(plotIdx);
-    if (p) p->addSignal(name, color);
+    if (!p) return;
+
+    // Find historical buffer data from the same signal in any other plot
+    const ScrollingBuffer* srcBuf = nullptr;
+    for (int pi = 0; pi < plotCount(); pi++) {
+        if (pi == plotIdx) continue;
+        PlotArea* other = getPlot(pi);
+        if (!other) continue;
+        MuxEntry* e = other->findEntry(name);
+        if (e && e->buffer.getCount() > 0) { srcBuf = &e->buffer; break; }
+    }
+
+    p->addSignal(name, color, bufferCapacity_);
+
+    // Copy historical data so the new plot shows existing waveform immediately
+    if (srcBuf) {
+        MuxEntry* newEntry = p->findEntry(name);
+        if (newEntry) newEntry->buffer = *srcBuf;
+    }
 }
 
 void ScopeModel::removeSignalFromPlot(int plotIdx, const std::string& name) {
@@ -74,6 +95,13 @@ void ScopeModel::clearAllBuffers() {
     for (auto& plot : plots_)
         for (auto& entry : plot->entries)
             entry->buffer.clear();
+}
+
+void ScopeModel::resizeAllBuffers(size_t newCapacity) {
+    bufferCapacity_ = newCapacity;
+    for (auto& plot : plots_)
+        for (auto& entry : plot->entries)
+            entry->buffer = ScrollingBuffer(newCapacity);  // rebuild with new capacity
 }
 
 void ScopeModel::autoFitAll() {

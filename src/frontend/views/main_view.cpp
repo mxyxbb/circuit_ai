@@ -29,12 +29,12 @@ void MainView::render(MainViewModel& vm) {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
-    ImGui::Begin("DockSpace", nullptr, dockspaceFlags);
+    bool dockspaceOpen = ImGui::Begin("DockSpace", nullptr, dockspaceFlags);
     ImGui::PopStyleVar(3);
 
     ImGuiID dockspaceId = ImGui::GetID("MainDockSpace");
 
-    if (firstFrame_) {
+    if (dockspaceOpen && firstFrame_) {
         ImGui::DockBuilderRemoveNode(dockspaceId);
         ImGui::DockBuilderAddNode(dockspaceId, ImGuiDockNodeFlags_DockSpace);
         ImGui::DockBuilderSetNodeSize(dockspaceId, viewport->WorkSize);

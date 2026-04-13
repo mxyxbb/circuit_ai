@@ -66,6 +66,6 @@ private:
     std::atomic<bool> stopRequested_{false};
     std::atomic<double> t_{0.0};
 
-    SPSCRingBuffer<SimSample, 65536> ringBuffer_;
+    SPSCRingBuffer<SimSample, 524288> ringBuffer_;
     size_t stepCount_ = 0;
 };

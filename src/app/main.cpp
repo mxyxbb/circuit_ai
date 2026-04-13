@@ -1,5 +1,6 @@
 #include "views/main_view.h"
 #include "view_model/main_view_model.h"
+#include "platform/file_dialog.h"
 #include "engine/diag.h"
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -54,7 +55,8 @@ int main() {
     if (!glfwInit()) return 1;
 
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
     GLFWwindow* window = glfwCreateWindow(1600, 900, "CircuitAI", nullptr, nullptr);
     if (!window) {
         glfwTerminate();
@@ -62,6 +64,9 @@ int main() {
     }
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
+
+    // Register window handle for native dialogs
+    platform::setMainWindow(window);
 
     // ImGui init
     IMGUI_CHECKVERSION();
@@ -73,7 +78,7 @@ int main() {
 
     ImGui::StyleColorsDark();
     ImGui_ImplGlfw_InitForOpenGL(window, true);
-    ImGui_ImplOpenGL3_Init("#version 130");
+    ImGui_ImplOpenGL3_Init("#version 330 core");
 
     // App objects
     MainViewModel viewModel;

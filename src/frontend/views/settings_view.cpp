@@ -1,19 +1,39 @@
 #include "views/settings_view.h"
 #include "view_model/main_view_model.h"
+#include "platform/file_dialog.h"
 #include <imgui.h>
+#include <cstring>
 
 SettingsView::SettingsView() : BaseView("Simulation Settings") {}
 
 void SettingsView::render(MainViewModel& vm) {
     if (!visible_) return;
-    ImGui::Begin(title_.c_str(), &visible_);
+    if (!ImGui::Begin(title_.c_str(), &visible_)) {
+        ImGui::End();
+        return;
+    }
 
     // Netlist file loader
     ImGui::Text("Netlist File:");
     ImGui::InputText("##path", netlistPath_, sizeof(netlistPath_));
     ImGui::SameLine();
     if (ImGui::Button("Load")) {
-        vm.loadNetlist(netlistPath_);
+        if (vm.loadNetlist(netlistPath_)) {
+            dtInput_    = vm.simConfig().dt;
+            tEndInput_  = vm.simConfig().t_end;
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Browse...")) {
+        std::string path = platform::openFileDialog();
+        if (!path.empty()) {
+            strncpy(netlistPath_, path.c_str(), sizeof(netlistPath_) - 1);
+            netlistPath_[sizeof(netlistPath_) - 1] = '\0';
+            if (vm.loadNetlist(netlistPath_)) {
+                dtInput_   = vm.simConfig().dt;
+                tEndInput_ = vm.simConfig().t_end;
+            }
+        }
     }
 
     ImGui::Separator();
@@ -23,16 +43,24 @@ void SettingsView::render(MainViewModel& vm) {
     ImGui::InputDouble("Step dt (s)", &dtInput_, 0.0, 0.0, "%.2e");
     ImGui::InputDouble("End time (s)", &tEndInput_, 0.0, 0.0, "%.2e");
 
+    // Informational: show estimated stored sample count (always ratio=1)
+    if (dtInput_ > 0.0 && tEndInput_ > 0.0) {
+        size_t estPts = static_cast<size_t>(tEndInput_ / dtInput_) + 1;
+        if (estPts > 5000000) estPts = 5000000; // capped
+        ImGui::TextDisabled("  ~%llu pts stored (capped at 5M)", static_cast<unsigned long long>(estPts));
+    }
+
     ImGui::Separator();
 
     // Control buttons
     if (vm.isSimRunning() && !vm.isSimPaused()) {
         if (ImGui::Button("Pause")) vm.pause();
-    } else {
-        if (ImGui::Button("Run")) vm.play();
+        ImGui::SameLine();
     }
-    ImGui::SameLine();
-    if (ImGui::Button("Reset")) vm.reset();
+    if (ImGui::Button("Run")) {   // always resets to t=0 before starting
+        vm.applySimConfig(dtInput_, tEndInput_);
+        vm.play();
+    }
 
     ImGui::Separator();
 

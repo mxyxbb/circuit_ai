@@ -24,6 +24,8 @@ public:
         vPrev_ = vnp - vnn;
     }
 
+    void reset() override { vPrev_ = 0.0; }
+
 private:
     std::string name_;
     int np_, nn_;

@@ -18,6 +18,7 @@ public:
     void play();
     void pause();
     void reset();
+    void applySimConfig(double dt, double tEnd);
 
     // Called each frame: consume simulation data, push to Scope
     void update();
@@ -33,6 +34,7 @@ public:
     ScopeModel& scope() { return scope_; }
     const ScopeModel& scope() const { return scope_; }
     const std::vector<SignalInfo>& availableSignals() const { return probes_; }
+    const SimConfig& simConfig() const { return config_; }
 
 private:
     void dispatchSample(const SimSample& sample);

@@ -1,4 +1,15 @@
 #include "view_model/main_view_model.h"
+#include <algorithm>
+
+// Calculate the ScrollingBuffer capacity needed to store all simulation samples
+// at sample_ratio=1.  Capped at MAX_STORED to bound memory usage.
+// (~5M doubles × 8 bytes × 2 arrays ≈ 80 MB per signal)
+static size_t calcBufferCapacity(double tEnd, double dt) {
+    constexpr size_t MAX_STORED = 5'000'000;
+    if (tEnd <= 0.0 || dt <= 0.0) return 10000;
+    size_t needed = static_cast<size_t>(tEnd / dt) + 1;
+    return std::min(needed, MAX_STORED);
+}
 
 MainViewModel::MainViewModel()
     : simulator_(std::make_unique<Simulator>()),
@@ -39,6 +50,10 @@ bool MainViewModel::loadNetlist(const std::string& filepath) {
         signalNameToIdx_[probes_[i].name] = i;
     }
 
+    // Storage side: always ratio=1 (no downsampling); cap buffer at 5M points
+    config_.sample_ratio = 1;
+    scope_.setBufferCapacity(calcBufferCapacity(config_.t_end, config_.dt));
+
     // Auto-populate scope with all probe signals in first plot
     autoPopulateScope();
 
@@ -58,7 +73,7 @@ void MainViewModel::autoPopulateScope() {
 
     ScopeModel::resetColorIndex();
     for (const auto& probe : probes_) {
-        plot->addSignal(probe.name, ScopeModel::nextColor());
+        plot->addSignal(probe.name, ScopeModel::nextColor(), scope_.getBufferCapacity());
     }
 }
 
@@ -67,7 +82,13 @@ void MainViewModel::play() {
         statusMsg_ = "No circuit loaded";
         return;
     }
-    simulator_->start();
+    // Always reset to t=0 and clear component state before starting
+    simulator_->reset();       // stops thread, resets component history and time to 0
+    scope_.clearAllBuffers();  // clear frontend waveform data
+    // reset() only restarts if the sim was already running; ensure it's started
+    if (!simulator_->isRunning()) {
+        simulator_->start();
+    }
     statusMsg_ = "Simulation running";
 }
 
@@ -102,6 +123,26 @@ void MainViewModel::dispatchSample(const SimSample& sample) {
             }
         }
     }
+}
+
+void MainViewModel::applySimConfig(double dt, double tEnd) {
+    if (dt <= 0.0 || tEnd <= 0.0) return;
+
+    config_.dt    = dt;
+    config_.t_end = tEnd;
+
+    // Storage side: always ratio=1; rebuild buffers with new capacity
+    config_.sample_ratio = 1;
+    scope_.resizeAllBuffers(calcBufferCapacity(tEnd, dt));
+
+    // Re-initialise simulator with updated config (resets to t=0)
+    if (circuit_ && !circuit_->components().empty()) {
+        simulator_->stop();
+        simulator_->setup(*circuit_, config_, probes_);
+    }
+
+    statusMsg_ = "Config applied: dt=" + std::to_string(dt)
+               + " t_end=" + std::to_string(tEnd);
 }
 
 bool MainViewModel::isSimRunning() const { return simulator_->isRunning(); }

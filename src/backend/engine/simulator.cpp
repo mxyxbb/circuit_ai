@@ -106,6 +106,12 @@ void Simulator::reset() {
     stop();
     t_.store(0.0);
     stepCount_ = 0;
+    // Reset component internal states (inductor iPrev, capacitor vPrev, etc.)
+    if (circuit_) {
+        for (const auto& comp : circuit_->components()) {
+            comp->reset();
+        }
+    }
     // Clear ring buffer by draining
     SimSample dummy;
     while (ringBuffer_.pop(dummy)) {}
@@ -201,10 +207,10 @@ bool Simulator::step() {
             }
             }
         }
-        while (!ringBuffer_.push(sample)) {
-            SimSample dummy;
-            ringBuffer_.pop(dummy);
-        }
+        // SPSC ring buffer: only the main thread may call pop().
+        // If the buffer is full, drop this sample rather than calling pop() here,
+        // which would create a second concurrent consumer and corrupt data.
+        ringBuffer_.push(sample);
     }
 
     t_ = t + dt;

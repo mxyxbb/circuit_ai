@@ -30,6 +30,8 @@ public:
         return x(extraOff);
     }
 
+    void reset() override { iPrev_ = 0.0; }
+
 private:
     std::string name_;
     int np_, nn_;

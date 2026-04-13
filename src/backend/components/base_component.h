@@ -25,4 +25,5 @@ public:
     virtual double getBranchCurrent(const Eigen::VectorXd& x, size_t extraOff) const {
         (void)x; (void)extraOff; return 0.0;
     }
+    virtual void reset() {}
 };
