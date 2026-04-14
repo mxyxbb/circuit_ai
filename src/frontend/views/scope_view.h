@@ -60,6 +60,18 @@ private:
     // ── Helpers ───────────────────────────────────────────────────────────────
     void ensurePlotYStates(int count);
 
+    // ── Smart axis formatting ──────────────────────────────────────────────────
+    struct AxisFmtParams {
+        double scaleFactor  = 1.0;    // divisor for scaled-sci mode (e.g. 1e-4)
+        int    exponent     = 0;      // for annotation label (e.g. -4)
+        int    decimals     = 4;      // digits after decimal point
+        bool   useScaledSci = false;  // true = divide tick value by scaleFactor
+        char   annotation[32] = {};   // "x 1e-4", empty when unused
+    };
+    static int  niceTickRound(int n);
+    static AxisFmtParams computeAxisFmt(double rangeMin, double rangeMax, float plotWidthPx);
+    static int  axisFormatterCallback(double value, char* buff, int size, void* user_data);
+
     // X axis: shared linked range across all plots
     double xLinkMin_ = 0.0;
     double xLinkMax_ = 0.01;

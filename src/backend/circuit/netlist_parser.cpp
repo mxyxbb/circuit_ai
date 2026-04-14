@@ -7,6 +7,7 @@
 #include "components/sources/current_source.h"
 #include "components/sources/square_wave_source.h"
 #include "components/sources/step_source.h"
+#include "components/sources/sin_source.h"
 #include "components/semiconductors/ideal_diode.h"
 #include "components/semiconductors/ideal_switch.h"
 
@@ -198,6 +199,16 @@ bool NetlistParser::processLine(const std::string& line, ParseResult& result) {
                     else if (p.find("TDELAY=") == 0) td = parseValue(p.substr(7));
                 }
                 result.circuit.addComponent(std::make_unique<StepSource>(name, np, nn, v0, v1, td));
+            } else if (srcType == "SIN") {
+                double voff = 0.0, vampl = 1.0, freq = 1e3, phase = 0.0;
+                for (size_t i = 4; i < tokens.size(); i++) {
+                    std::string p = toUpper(tokens[i]);
+                    if (p.find("VOFF=") == 0) voff = parseValue(p.substr(5));
+                    else if (p.find("VAMPL=") == 0) vampl = parseValue(p.substr(6));
+                    else if (p.find("FREQ=") == 0) freq = parseValue(p.substr(5));
+                    else if (p.find("PHASE=") == 0) phase = std::stod(p.substr(6));
+                }
+                result.circuit.addComponent(std::make_unique<SinSource>(name, np, nn, voff, vampl, freq, phase));
             } else {
                 result.error = "Unknown source type: " + srcType;
                 return false;

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstring>
 
 ScopeView::ScopeView() : BaseView("Scope") {}
 
@@ -83,6 +84,91 @@ static int decimateMinMax(
 void ScopeView::ensurePlotYStates(int count) {
     while ((int)plotYStates_.size() < count)
         plotYStates_.push_back({-1.0, 1.0, false});
+}
+
+// ─────────────────────── Smart axis formatting ─────────────────────────────
+int ScopeView::niceTickRound(int n) {
+    // 1-2-5 decade series (with 4, 8 extensions)
+    static const int nice[] = {2,4,5,8,10,15,20,25,30,40,50,60,80,100};
+    if (n <= nice[0]) return nice[0];
+    for (int i = 1; i < (int)(sizeof(nice)/sizeof(nice[0])); i++) {
+        if (nice[i] > n) return nice[i-1];
+    }
+    return nice[(int)(sizeof(nice)/sizeof(nice[0])) - 1];
+}
+
+ScopeView::AxisFmtParams ScopeView::computeAxisFmt(
+    double rangeMin, double rangeMax, float plotWidthPx)
+{
+    AxisFmtParams params;
+
+    double range = std::abs(rangeMax - rangeMin);
+
+    // Degenerate range
+    if (range < 1e-30) {
+        params.decimals = 6;
+        return params;
+    }
+
+    // Step 1-2: initial tick estimate
+    double tickStep = range / 5.0;
+
+    // Step 3: decimal precision from initial tick step
+    int decimals = 0;
+    if (tickStep > 0 && tickStep < 1.0)
+        decimals = (int)std::ceil(-std::log10(tickStep));
+    if (decimals > 6) decimals = 6;
+
+    // Step 4: label character length from sample value
+    char sample[32];
+    snprintf(sample, sizeof(sample), "%.*f", decimals, rangeMin + tickStep);
+    int labelLen = (int)std::strlen(sample);
+    if (labelLen < 1) labelLen = 1;
+
+    // Step 5: max ticks that fit in plot width, rounded to nice 2-5 series
+    float charWidth = ImGui::CalcTextSize("0").x;
+    if (charWidth < 1.0f) charWidth = 7.0f;
+    int rawTicks = (int)(plotWidthPx / ((float)labelLen * charWidth));
+    int maxTicks = niceTickRound(rawTicks);
+
+    // Step 6: recalculate tick step and decimals from nice tick count
+    double finalTickStep = range / (double)maxTicks;
+    decimals = 0;
+    if (finalTickStep > 0 && finalTickStep < 1.0)
+        decimals = (int)std::ceil(-std::log10(finalTickStep));
+    if (decimals > 6) decimals = 6;
+
+    // Step 7: scientific notation scaling for very small values
+    double maxAbsVal = std::max(std::abs(rangeMin), std::abs(rangeMax));
+    if (maxAbsVal > 0 && maxAbsVal < 0.06) {
+        int exponent = (int)std::floor(std::log10(maxAbsVal));
+        double scaleFactor = std::pow(10.0, (double)exponent);
+
+        double scaledTickStep = finalTickStep / scaleFactor;
+        decimals = 0;
+        if (scaledTickStep > 0 && scaledTickStep < 1.0)
+            decimals = (int)std::ceil(-std::log10(scaledTickStep));
+        if (decimals > 6) decimals = 6;
+
+        params.scaleFactor  = scaleFactor;
+        params.exponent     = exponent;
+        params.decimals     = decimals;
+        params.useScaledSci = true;
+        snprintf(params.annotation, sizeof(params.annotation),
+                 "x 1e%d", exponent);
+    } else {
+        params.decimals     = decimals;
+    }
+
+    return params;
+}
+
+int ScopeView::axisFormatterCallback(double value, char* buff, int size, void* user_data) {
+    auto* p = static_cast<const AxisFmtParams*>(user_data);
+    if (p->useScaledSci)
+        return snprintf(buff, (size_t)size, "%.*f", p->decimals, value / p->scaleFactor);
+    else
+        return snprintf(buff, (size_t)size, "%.*f", p->decimals, value);
 }
 
 // ─────────────────────── Undo stack ───────────────────────────────────────
@@ -170,7 +256,10 @@ void ScopeView::computeAutoFitPlot(MainViewModel& vm, int plotIndex, bool allDat
 
 void ScopeView::computeAutoFitAll(MainViewModel& vm) {
     pushSnapshot(vm.scope().plotCount());
-    // Scan ALL stored data — not just the currently visible X window
+    // Step 1: reset X axis to full simulation range
+    xLinkMin_ = 0.0;
+    xLinkMax_ = vm.simConfig().t_end;
+    // Step 2: auto-fit Y for each plot (scan all stored data)
     for (int i = 0; i < vm.scope().plotCount(); i++)
         computeAutoFitPlot(vm, i, /*allData=*/true);
 }
@@ -332,6 +421,10 @@ void ScopeView::renderPlot(MainViewModel& vm, PlotArea& plot,
     if (zoomMode_ != ZoomMode::None)
         plotFlags |= ImPlotFlags_NoBoxSelect;  // disable ImPlot's own box-select
 
+    // Estimate plot width BEFORE BeginPlot — GetPlotSize() locks the setup phase,
+    // so all Setup* calls must precede any non-setup API.
+    float plotWidthPx = ImGui::GetContentRegionAvail().x;
+
     bool plotOk = ImPlot::BeginPlot(plot.title.c_str(), ImVec2(-1, plotHeight), plotFlags);
 
     // Pop style immediately — border rendering happens inside BeginPlot
@@ -345,29 +438,29 @@ void ScopeView::renderPlot(MainViewModel& vm, PlotArea& plot,
     // X axis: linked so all plots pan/zoom together
     ImPlot::SetupAxis(ImAxis_X1, "Time (s)");
     ImPlot::SetupAxisLinks(ImAxis_X1, &xLinkMin_, &xLinkMax_);
-    ImPlot::SetupAxisFormat(ImAxis_X1, "%.4f");
+    AxisFmtParams xFmt = computeAxisFmt(xLinkMin_, xLinkMax_, plotWidthPx);
+    ImPlot::SetupAxisFormat(ImAxis_X1, axisFormatterCallback, &xFmt);
 
-    // Y axis: fixed-width scientific notation keeps label columns aligned.
+    // Y axis: smart formatting adapts to value range.
     // No AutoFit flag — we control limits ourselves for accurate undo.
     ImPlot::SetupAxis(ImAxis_Y1, "Value", ImPlotAxisFlags_None);
-    ImPlot::SetupAxisFormat(ImAxis_Y1, "% .3e");
 
     // Apply stored Y limits if requested (after auto-fit, V-zoom, or undo)
     ensurePlotYStates(plotIndex + 1);
+    double yMin = plotYStates_[plotIndex].yMin;
+    double yMax = plotYStates_[plotIndex].yMax;
     if (plotYStates_[plotIndex].forceSet) {
-        ImPlot::SetupAxisLimits(ImAxis_Y1,
-            plotYStates_[plotIndex].yMin,
-            plotYStates_[plotIndex].yMax,
-            ImPlotCond_Always);
+        ImPlot::SetupAxisLimits(ImAxis_Y1, yMin, yMax, ImPlotCond_Always);
         plotYStates_[plotIndex].forceSet = false;
     }
+    AxisFmtParams yFmt = computeAxisFmt(yMin, yMax, plotWidthPx);
+    ImPlot::SetupAxisFormat(ImAxis_Y1, axisFormatterCallback, &yFmt);
 
     // ── Decimated signal rendering ────────────────────────────────────────────
     // Target: at most 2 × plot pixel width output points per signal.
     // The decimateMinMax algorithm preserves all peaks and valleys by keeping
     // the min-Y and max-Y point within each equal-width bucket.
-    float plotWidthPx = ImPlot::GetPlotSize().x;
-    int   maxPts      = std::max(500, static_cast<int>(plotWidthPx * 2.0f));
+    int maxPts = std::max(500, static_cast<int>(plotWidthPx * 2.0f));
 
     for (auto& entry : plot.entries) {
         if (!entry->visible) continue;
@@ -491,6 +584,24 @@ void ScopeView::renderPlot(MainViewModel& vm, PlotArea& plot,
     if (ImGui::BeginPopup("PlotCtx")) {
         renderPlotContextMenu(vm, plotIndex);
         ImGui::EndPopup();
+    }
+
+    // ── Scale annotation for scaled-scientific axes ──
+    {
+        ImDrawList* dl  = ImPlot::GetPlotDrawList();
+        ImVec2 plotPos  = ImPlot::GetPlotPos();
+        ImVec2 plotSize = ImPlot::GetPlotSize();
+        if (xFmt.useScaledSci) {
+            ImVec2 ts = ImGui::CalcTextSize(xFmt.annotation);
+            dl->AddText({plotPos.x + plotSize.x - ts.x - 4,
+                         plotPos.y + plotSize.y - ts.y - 2},
+                        IM_COL32(180,180,180,255), xFmt.annotation);
+        }
+        if (yFmt.useScaledSci) {
+            ImVec2 ts = ImGui::CalcTextSize(yFmt.annotation);
+            dl->AddText({plotPos.x + 4, plotPos.y + 2},
+                        IM_COL32(180,180,180,255), yFmt.annotation);
+        }
     }
 
     // ── Track current Y limits for accurate undo snapshots ────────────────────
