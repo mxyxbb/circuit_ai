@@ -31,6 +31,7 @@ public:
     double currentTime() const { return t_.load(); }
 
     bool consumeSample(SimSample& sample) { return ringBuffer_.pop(sample); }
+    bool consumeDiagEvent(DiagEvent& ev)  { return diagRing_.pop(ev); }
 
     size_t nodeCount() const { return n_; }
     const std::vector<SignalInfo>& probes() const { return probes_; }
@@ -67,5 +68,6 @@ private:
     std::atomic<double> t_{0.0};
 
     SPSCRingBuffer<SimSample, 524288> ringBuffer_;
+    SPSCRingBuffer<DiagEvent, 256>   diagRing_;   // power-of-2; drop-newest on overflow
     size_t stepCount_ = 0;
 };

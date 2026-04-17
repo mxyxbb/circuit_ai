@@ -59,6 +59,23 @@ int ScopeModel::insertPlot(int insertAfterIdx, const std::string& title) {
 void ScopeModel::removePlot(int index) {
     if (plotCount() <= 1) return; // keep at least one
     if (index < 0 || index >= plotCount()) return;
+
+    // Rescue buffer data for signals that exist nowhere else, so they can
+    // be re-added to a new plot later and still show historical waveforms.
+    PlotArea* dying = plots_[index].get();
+    for (const auto& entry : dying->entries) {
+        if (entry->buffer.getCount() == 0) continue;
+        // Only cache if no other active plot already holds data for this signal
+        bool foundElsewhere = false;
+        for (int pi = 0; pi < plotCount(); pi++) {
+            if (pi == index) continue;
+            MuxEntry* e = plots_[pi]->findEntry(entry->signalName);
+            if (e && e->buffer.getCount() > 0) { foundElsewhere = true; break; }
+        }
+        if (!foundElsewhere)
+            signalCache_[entry->signalName] = entry->buffer;
+    }
+
     plots_.erase(plots_.begin() + index);
     if (selectedPlot_ >= plotCount()) selectedPlot_ = plotCount() - 1;
 }
@@ -67,7 +84,8 @@ void ScopeModel::addSignalToPlot(int plotIdx, const std::string& name, ImU32 col
     PlotArea* p = getPlot(plotIdx);
     if (!p) return;
 
-    // Find historical buffer data from the same signal in any other plot
+    // Find historical buffer data from same signal: first search active plots,
+    // then fall back to the rescue cache (populated when plots are deleted).
     const ScrollingBuffer* srcBuf = nullptr;
     for (int pi = 0; pi < plotCount(); pi++) {
         if (pi == plotIdx) continue;
@@ -75,6 +93,11 @@ void ScopeModel::addSignalToPlot(int plotIdx, const std::string& name, ImU32 col
         if (!other) continue;
         MuxEntry* e = other->findEntry(name);
         if (e && e->buffer.getCount() > 0) { srcBuf = &e->buffer; break; }
+    }
+    if (!srcBuf) {
+        auto it = signalCache_.find(name);
+        if (it != signalCache_.end() && it->second.getCount() > 0)
+            srcBuf = &it->second;
     }
 
     p->addSignal(name, color, bufferCapacity_);
@@ -95,6 +118,7 @@ void ScopeModel::clearAllBuffers() {
     for (auto& plot : plots_)
         for (auto& entry : plot->entries)
             entry->buffer.clear();
+    signalCache_.clear();
 }
 
 void ScopeModel::resizeAllBuffers(size_t newCapacity) {

@@ -1,5 +1,6 @@
 #pragma once
 #include "view_model/scope_model.h"
+#include "view_model/schematic_model.h"
 #include "common/sim_types.h"
 #include "engine/simulator.h"
 #include "circuit/netlist_parser.h"
@@ -30,11 +31,20 @@ public:
     const std::string& netlistPath() const { return netlistPath_; }
     const std::string& statusMessage() const { return statusMsg_; }
 
+    // Diagnostics log (populated from simulator thread via SPSC ring)
+    const std::vector<DiagEvent>& diagLog() const { return diagLog_; }
+    void clearDiagLog() { diagLog_.clear(); }
+
     // Data access
     ScopeModel& scope() { return scope_; }
     const ScopeModel& scope() const { return scope_; }
     const std::vector<SignalInfo>& availableSignals() const { return probes_; }
     const SimConfig& simConfig() const { return config_; }
+
+    // Schematic canvas model + build-from-schematic
+    SchematicModel& schematic() { return schematic_; }
+    const SchematicModel& schematic() const { return schematic_; }
+    void buildFromSchematic();
 
 private:
     void dispatchSample(const SimSample& sample);
@@ -52,4 +62,9 @@ private:
 
     // Signal name → index in SimSample.values
     std::unordered_map<std::string, size_t> signalNameToIdx_;
+
+    std::vector<DiagEvent> diagLog_;
+    static constexpr size_t kMaxDiagLog = 200;
+
+    SchematicModel schematic_;
 };

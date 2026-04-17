@@ -181,15 +181,16 @@ bool NetlistParser::processLine(const std::string& line, ParseResult& result) {
                 double v = parseValue(tokens[4]);
                 result.circuit.addComponent(std::make_unique<VoltageSource>(name, np, nn, v));
             } else if (srcType == "SQUARE") {
-                double freq = 1e3, duty = 0.5, vhigh = 1.0, vlow = 0.0;
+                double freq = 1e3, duty = 0.5, vhigh = 1.0, vlow = 0.0, tdelay = 0.0;
                 for (size_t i = 4; i < tokens.size(); i++) {
                     std::string p = toUpper(tokens[i]);
                     if (p.find("FREQ=") == 0) freq = parseValue(p.substr(5));
                     else if (p.find("DUTY=") == 0) duty = std::stod(p.substr(5));
                     else if (p.find("VHIGH=") == 0) vhigh = parseValue(p.substr(6));
                     else if (p.find("VLOW=") == 0) vlow = parseValue(p.substr(5));
+                    else if (p.find("TDELAY=") == 0) tdelay = parseValue(p.substr(7));
                 }
-                result.circuit.addComponent(std::make_unique<SquareWaveSource>(name, np, nn, freq, duty, vhigh, vlow));
+                result.circuit.addComponent(std::make_unique<SquareWaveSource>(name, np, nn, freq, duty, vhigh, vlow, tdelay));
             } else if (srcType == "STEP") {
                 double v0 = 0.0, v1 = 1.0, td = 0.0;
                 for (size_t i = 4; i < tokens.size(); i++) {
@@ -236,18 +237,70 @@ bool NetlistParser::processLine(const std::string& line, ParseResult& result) {
             return true;
         }
         default:
-            // Try TX for transformer
+            // TX<name> — ideal multi-winding transformer
+            // Format: TX<n> N0+ N0- N1+ N1- [N2+ N2- ...] [turns1=<v>] [turns2=<v>] ... [ratio=<v>]
+            //
+            // Node pairs are collected until a token containing '=' is encountered.
+            // Turns assignment:
+            //   - turns<k>=  sets the turn count for winding k (1-based index in netlist).
+            //   - ratio=     shorthand for 2-winding case: turns of winding 0 = ratio, winding 1 = 1.
+            //   - Unspecified windings default to turns = 1.
             if (first.size() >= 2 && (first[0] == 'T' || first[0] == 't') && toupper(first[1]) == 'X') {
-                if (tokens.size() < 6) { result.error = "TX: need N1+ N1- N2+ N2- ratio"; return false; }
-                int np1 = std::stoi(tokens[1]), nn1 = std::stoi(tokens[2]);
-                int np2 = std::stoi(tokens[3]), nn2 = std::stoi(tokens[4]);
-                double ratio = 1.0;
-                for (size_t i = 5; i < tokens.size(); i++) {
-                    std::string p = toUpper(tokens[i]);
-                    if (p.find("RATIO=") == 0) ratio = std::stod(p.substr(6));
-                    else ratio = parseValue(tokens[i]);
+                // Collect node pairs (tokens that do NOT contain '=')
+                std::vector<std::pair<int,int>> nodePairs;
+                size_t paramStart = 1;
+                for (size_t i = 1; i + 1 < tokens.size(); i += 2) {
+                    if (tokens[i].find('=') != std::string::npos ||
+                        tokens[i+1].find('=') != std::string::npos) {
+                        paramStart = i;
+                        break;
+                    }
+                    try {
+                        int np = std::stoi(tokens[i]);
+                        int nn = std::stoi(tokens[i + 1]);
+                        nodePairs.emplace_back(np, nn);
+                        paramStart = i + 2;
+                    } catch (...) {
+                        paramStart = i;
+                        break;
+                    }
                 }
-                result.circuit.addComponent(std::make_unique<Transformer>(name, np1, nn1, np2, nn2, ratio));
+                if (nodePairs.size() < 2) {
+                    result.error = "TX: need at least two winding node pairs (N0+ N0- N1+ N1-)";
+                    return false;
+                }
+
+                // Parse key=value parameters
+                size_t numWindings = nodePairs.size();
+                std::vector<double> turns(numWindings, 1.0);
+                double ratio = -1.0; // sentinel: not set
+                for (size_t i = paramStart; i < tokens.size(); i++) {
+                    std::string p = toUpper(tokens[i]);
+                    if (p.find("RATIO=") == 0) {
+                        ratio = std::stod(p.substr(6));
+                    } else if (p.find("TURNS") == 0) {
+                        // turnsN= where N is 1-based winding index
+                        size_t eqPos = p.find('=');
+                        if (eqPos != std::string::npos) {
+                            int idx = std::stoi(p.substr(5, eqPos - 5)); // 1-based
+                            if (idx >= 1 && static_cast<size_t>(idx) <= numWindings)
+                                turns[idx - 1] = std::stod(p.substr(eqPos + 1));
+                        }
+                    }
+                }
+                // Apply ratio shorthand for 2-winding case
+                if (ratio > 0.0) {
+                    turns[0] = ratio;
+                    turns[1] = 1.0;
+                }
+
+                // Build winding list
+                std::vector<Transformer::Winding> windings;
+                windings.reserve(numWindings);
+                for (size_t k = 0; k < numWindings; k++)
+                    windings.push_back({nodePairs[k].first, nodePairs[k].second, turns[k]});
+
+                result.circuit.addComponent(std::make_unique<Transformer>(name, std::move(windings)));
                 return true;
             }
             result.error = "Unknown component prefix: " + name;

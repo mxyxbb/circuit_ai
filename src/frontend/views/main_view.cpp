@@ -42,7 +42,7 @@ void MainView::render(MainViewModel& vm) {
         ImGuiID dockLeft, dockCenter, dockRight;
         ImGui::DockBuilderSplitNode(dockspaceId, ImGuiDir_Left, 0.2f, &dockLeft, &dockCenter);
         ImGuiID dockCenterTop, dockCenterBottom;
-        ImGui::DockBuilderSplitNode(dockCenter, ImGuiDir_Up, 0.2f, &dockCenterTop, &dockCenterBottom);
+        ImGui::DockBuilderSplitNode(dockCenter, ImGuiDir_Up, 0.4f, &dockCenterTop, &dockCenterBottom);
 
         ImGui::DockBuilderDockWindow(settingsView_->title().c_str(), dockLeft);
         ImGui::DockBuilderDockWindow(paletteView_->title().c_str(), dockLeft);

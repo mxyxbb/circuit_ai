@@ -2,6 +2,7 @@
 #include "circuit/circuit.h"
 #include "components/base_component.h"
 #include <chrono>
+#include <cstdio>
 
 Simulator::Simulator() : solver_(std::make_unique<MNASolver>()) {}
 Simulator::~Simulator() { stop(); }
@@ -112,9 +113,11 @@ void Simulator::reset() {
             comp->reset();
         }
     }
-    // Clear ring buffer by draining
+    // Clear ring buffers by draining
     SimSample dummy;
     while (ringBuffer_.pop(dummy)) {}
+    DiagEvent dummyDiag;
+    while (diagRing_.pop(dummyDiag)) {}
     if (wasRunning) start();
 }
 
@@ -145,6 +148,7 @@ bool Simulator::step() {
     double t = t_.load();
 
     // Iterative solve for nonlinear components
+    bool converged = true;   // hoisted: reflects result of the last iteration
     const Eigen::VectorXd* xp = nullptr;
     for (int iter = 0; iter < MAX_ITER; ++iter) {
         solver_->clear();
@@ -159,7 +163,7 @@ bool Simulator::step() {
         xp = &x;
 
         // Check convergence for nonlinear components
-        bool converged = true;
+        converged = true;
         ci = 0;
         for (const auto& comp : circuit_->components()) {
             if (comp->updateState(x, compExtraAbs_[ci])) {
@@ -170,8 +174,24 @@ bool Simulator::step() {
         if (converged) break;
     }
 
+    // Emit diagnostic warning if MAX_ITER was exhausted without convergence
+    if (!converged) {
+        char buf[80];
+        snprintf(buf, sizeof(buf),
+                 "t=%.3e: convergence failed after %d iterations", t, MAX_ITER);
+        diagRing_.push({DiagEvent::Warning, t, buf});
+    }
+
     // xp points to the final solution from the last solve()
     const auto& x = *xp;
+
+    // Emit diagnostic error if the solution contains NaN or Inf values
+    if (!x.allFinite()) {
+        char buf[96];
+        snprintf(buf, sizeof(buf),
+                 "t=%.3e: solver NaN/Inf - check for floating nodes or V-source loops", t);
+        diagRing_.push({DiagEvent::Error, t, buf});
+    }
 
     // Commit history for storage components
     size_t ci = 0;

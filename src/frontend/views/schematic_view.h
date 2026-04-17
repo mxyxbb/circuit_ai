@@ -1,8 +1,58 @@
 #pragma once
 #include "views/base_view.h"
+#include <imgui.h>
+#include <string>
+#include <vector>
 
 class SchematicView : public BaseView {
 public:
-    SchematicView() : BaseView("Schematic") {}
+    SchematicView();
     void render(MainViewModel& vm) override;
+
+private:
+    // ── Canvas pan / zoom ───────────────────────────────────────────────────
+    ImVec2 panOffset_{200.0f, 150.0f};  // canvas-space translation
+    float  zoom_ = 1.0f;
+
+    // ── Selection & movement ────────────────────────────────────────────────
+    int    selectedCompId_ = -1;
+    int    selectedWireId_ = -1;
+    int    movingCompId_   = -1;
+    ImVec2 moveStartCanvas_{0, 0};  // canvas pos when move began
+    ImVec2 moveCompOrigPos_{0, 0};  // component's original position
+
+    // ── Wire drawing ────────────────────────────────────────────────────────
+    bool wiringActive_   = false;
+    int  wireFromCompId_ = -1;
+    int  wireFromPinIdx_ = -1;
+    std::vector<ImVec2> wireWaypoints_;  // intermediate points accumulated during wiring
+
+    // ── Panning (right-mouse) ────────────────────────────────────────────────
+    bool panningActive_ = false;
+
+    // ── Property editor buffers ─────────────────────────────────────────────
+    int  propEditCompId_ = -1;
+    char propNameBuf_[64]  = {};
+    char propBufs_[8][64]  = {};    // up to 8 params per component
+
+    // ── Coordinate helpers ───────────────────────────────────────────────────
+    ImVec2 s2c(ImVec2 screenPt, ImVec2 origin) const;   // screen → canvas
+    ImVec2 c2s(ImVec2 canvasPt, ImVec2 origin) const;   // canvas → screen
+    static ImVec2 snapGrid(ImVec2 pos, float g = 20.0f);
+    // Rotate a pin offset by the component's rotation (0/1/2/3 = 0/90/180/270° CW)
+    static ImVec2 rotateOff(ImVec2 off, int rot);
+    // Canvas position of pin pi on comp (rotation applied)
+    static ImVec2 pinCanvasPos(const struct SchematicComp& comp, int pi);
+
+    // ── Helpers ─────────────────────────────────────────────────────────────
+    static const char* polaritySymbol(const std::string& pinLabel);
+    static float distPointToSegment(ImVec2 pt, ImVec2 a, ImVec2 b);
+
+    // ── Sub-renderers ────────────────────────────────────────────────────────
+    void handleInput(MainViewModel& vm, bool hovered, ImVec2 origin);
+    void drawGrid(ImDrawList* dl, ImVec2 origin, ImVec2 size) const;
+    void drawWires(ImDrawList* dl, MainViewModel& vm, ImVec2 origin) const;
+    void drawComponents(ImDrawList* dl, MainViewModel& vm, ImVec2 origin);
+    void drawRubberBand(ImDrawList* dl, MainViewModel& vm, ImVec2 origin) const;
+    void renderProperties(MainViewModel& vm);
 };

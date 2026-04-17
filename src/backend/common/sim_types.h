@@ -22,3 +22,11 @@ struct SimConfig {
     double t_end        = 0.01;
     int    sample_ratio = 1; // push one sample every N steps
 };
+
+// Diagnostic event emitted by the simulation engine (convergence failures, NaN, etc.)
+struct DiagEvent {
+    enum Level { Info, Warning, Error };
+    Level       level   = Info;
+    double      time    = 0.0;
+    std::string message;
+};

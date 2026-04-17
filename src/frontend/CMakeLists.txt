@@ -1,5 +1,6 @@
 add_library(circuit_frontend STATIC
     view_model/scope_model.cpp
+    view_model/schematic_model.cpp
     view_model/main_view_model.cpp
     views/main_view.cpp
     views/scope_view.cpp

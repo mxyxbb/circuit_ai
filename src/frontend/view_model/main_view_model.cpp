@@ -1,5 +1,6 @@
 #include "view_model/main_view_model.h"
 #include <algorithm>
+#include <cstdio>
 
 // Calculate the ScrollingBuffer capacity needed to store all simulation samples
 // at sample_ratio=1.  Capped at MAX_STORED to bound memory usage.
@@ -57,6 +58,7 @@ bool MainViewModel::loadNetlist(const std::string& filepath) {
     // Auto-populate scope with all probe signals in first plot
     autoPopulateScope();
 
+    diagLog_.clear();
     statusMsg_ = "Loaded: " + filepath + " (" +
                  std::to_string(circuit_->components().size()) + " components, " +
                  std::to_string(probes_.size()) + " probes)";
@@ -98,6 +100,7 @@ void MainViewModel::pause() {
 }
 
 void MainViewModel::reset() {
+    diagLog_.clear();
     simulator_->reset();
     scope_.clearAllBuffers();
     statusMsg_ = "Simulation reset";
@@ -108,6 +111,14 @@ void MainViewModel::update() {
     SimSample sample;
     while (simulator_->consumeSample(sample)) {
         dispatchSample(sample);
+    }
+
+    // Drain all diagnostic events emitted by the simulation thread
+    DiagEvent dev;
+    while (simulator_->consumeDiagEvent(dev)) {
+        if (diagLog_.size() >= kMaxDiagLog)
+            diagLog_.erase(diagLog_.begin());  // drop oldest to stay within cap
+        diagLog_.push_back(std::move(dev));
     }
 }
 
@@ -148,3 +159,48 @@ void MainViewModel::applySimConfig(double dt, double tEnd) {
 bool MainViewModel::isSimRunning() const { return simulator_->isRunning(); }
 bool MainViewModel::isSimPaused()  const { return simulator_->isPaused(); }
 double MainViewModel::currentTime() const { return simulator_->currentTime(); }
+
+void MainViewModel::buildFromSchematic() {
+    std::string netlist = schematic_.generateNetlist(schematic_.simCfg);
+    if (netlist.empty()) {
+        statusMsg_ = "Schematic is empty — add components and a GND symbol first";
+        return;
+    }
+
+    simulator_->stop();
+    circuit_ = std::make_unique<Circuit>();
+    scope_.clearAllBuffers();
+    signalNameToIdx_.clear();
+    diagLog_.clear();
+
+    NetlistParser parser;
+    ParseResult result = parser.parseString(netlist);
+
+    if (!result.success) {
+        statusMsg_ = "Schematic build error: " + result.error;
+        return;
+    }
+
+    circuit_ = std::make_unique<Circuit>(std::move(result.circuit));
+    config_  = result.config;
+    probes_  = result.probes;
+
+    if (!simulator_->setup(*circuit_, config_, probes_)) {
+        statusMsg_ = "Failed to setup simulator from schematic";
+        return;
+    }
+
+    for (size_t i = 0; i < probes_.size(); i++)
+        signalNameToIdx_[probes_[i].name] = i;
+
+    config_.sample_ratio = 1;
+    scope_.setBufferCapacity(calcBufferCapacity(config_.t_end, config_.dt));
+    autoPopulateScope();
+
+    char buf[128];
+    snprintf(buf, sizeof(buf), "Built from schematic: %zu components, %zu probes",
+             circuit_->components().size(), probes_.size());
+    statusMsg_ = buf;
+
+    play();
+}

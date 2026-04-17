@@ -10,4 +10,5 @@ private:
     char netlistPath_[260] = "";
     double dtInput_ = 1e-6;
     double tEndInput_ = 0.01;
+    size_t lastDiagCount_ = 0;  // detect new log entries for auto-scroll
 };

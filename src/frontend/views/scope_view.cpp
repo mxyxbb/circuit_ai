@@ -86,6 +86,46 @@ void ScopeView::ensurePlotYStates(int count) {
         plotYStates_.push_back({-1.0, 1.0, false});
 }
 
+// Insert a plot and keep plotYStates_ positionally in sync so existing
+// plots' Y ranges are not disturbed by the index shift.
+//
+// Root cause of the original bug: ScopeModel re-numbers plot titles on
+// every insert/remove.  ImPlot uses the title string as its internal ID —
+// once a title changes, ImPlot treats the plot as brand-new and resets its
+// cached axis limits to defaults.  Fixing the positional mapping in
+// plotYStates_ is necessary but not sufficient; we also need to set
+// forceSet=true on every displaced plot so that SetupAxisLimits(Always)
+// is called next frame and the correct limits are explicitly restored.
+void ScopeView::insertPlot(ScopeModel& scope, int insertAfterIdx) {
+    int prevCount = scope.plotCount();
+    ensurePlotYStates(prevCount);
+    int newIdx = scope.insertPlot(insertAfterIdx);
+    if (scope.plotCount() > prevCount) {
+        // Splice in a fresh default state for the new (empty) plot.
+        plotYStates_.insert(plotYStates_.begin() + newIdx, {-1.0, 1.0, false});
+        // All plots at positions > newIdx have been renamed (title +1).
+        // Force-restore their Y limits so ImPlot's stale-ID reset is overridden.
+        for (int i = newIdx + 1; i < (int)plotYStates_.size(); i++)
+            plotYStates_[i].forceSet = true;
+        plotStructureChanged_ = true;
+    }
+}
+
+// Remove a plot and keep plotYStates_ positionally in sync so remaining
+// plots' Y ranges are not disturbed by the index shift.
+void ScopeView::removePlot(ScopeModel& scope, int index) {
+    if (scope.plotCount() <= 1) return;
+    ensurePlotYStates(scope.plotCount());
+    scope.removePlot(index);
+    if (index < (int)plotYStates_.size())
+        plotYStates_.erase(plotYStates_.begin() + index);
+    // All plots at positions >= index have been renamed (title -1).
+    // Force-restore their Y limits so ImPlot's stale-ID reset is overridden.
+    for (int i = index; i < (int)plotYStates_.size(); i++)
+        plotYStates_[i].forceSet = true;
+    plotStructureChanged_ = true;
+}
+
 // ─────────────────────── Smart axis formatting ─────────────────────────────
 int ScopeView::niceTickRound(int n) {
     // 1-2-5 decade series (with 4, 8 extensions)
@@ -273,6 +313,11 @@ void ScopeView::render(MainViewModel& vm) {
         return;
     }
 
+    // Reset per-frame structure-change guard.  Must happen before any
+    // insertPlot/removePlot calls (toolbar buttons, context menu) so that
+    // the flag correctly reflects whether the plot list changed this frame.
+    plotStructureChanged_ = false;
+
     ScopeModel& scope = vm.scope();
 
     // Reset linked X range whenever t_end changes (new netlist or config applied)
@@ -298,57 +343,17 @@ void ScopeView::render(MainViewModel& vm) {
 
     ensurePlotYStates(scope.plotCount());
 
-    // When H-Zoom or V-Zoom is active, move ImPlot's default left-mouse pan to
-    // middle mouse so our custom drag does not conflict with ImPlot's pan.
-    if (zoomMode_ != ZoomMode::None) {
-        ImPlot::GetInputMap().Pan = ImGuiMouseButton_Middle;
-    } else {
-        ImPlot::GetInputMap().Pan = ImGuiMouseButton_Left;
-    }
-
     // ── Toolbar ───────────────────────────────────────────────────────────────
     if (ImGui::Button("+ Plot Above")) {
-        scope.insertPlot(scope.selectedPlot() - 1);
+        insertPlot(scope, scope.selectedPlot() - 1);
     }
     ImGui::SameLine();
     if (ImGui::Button("+ Plot Below")) {
-        scope.insertPlot(scope.selectedPlot());
+        insertPlot(scope, scope.selectedPlot());
     }
     ImGui::SameLine();
     if (ImGui::Button("Auto-Fit All")) {
         computeAutoFitAll(vm);
-    }
-    ImGui::SameLine();
-
-    // H-Zoom toggle (highlighted when active)
-    {
-        bool active = (zoomMode_ == ZoomMode::HZoom);
-        if (active)
-            ImGui::PushStyleColor(ImGuiCol_Button,
-                                  ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
-        if (ImGui::Button("H-Zoom")) {
-            zoomMode_   = active ? ZoomMode::None : ZoomMode::HZoom;
-            dragActive_ = false;
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Drag to select horizontal (time) zoom range");
-        if (active) ImGui::PopStyleColor();
-    }
-    ImGui::SameLine();
-
-    // V-Zoom toggle
-    {
-        bool active = (zoomMode_ == ZoomMode::VZoom);
-        if (active)
-            ImGui::PushStyleColor(ImGuiCol_Button,
-                                  ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
-        if (ImGui::Button("V-Zoom")) {
-            zoomMode_   = active ? ZoomMode::None : ZoomMode::VZoom;
-            dragActive_ = false;
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Drag in a plot to select its vertical zoom range");
-        if (active) ImGui::PopStyleColor();
     }
     ImGui::SameLine();
 
@@ -366,11 +371,12 @@ void ScopeView::render(MainViewModel& vm) {
 
     ImGui::Separator();
 
-    // Calculate equal plot height
+    // Calculate equal plot height.
+    // Between plots we emit one ImGui::Spacing() which consumes ItemSpacing.y.
     int   n          = scope.plotCount();
     float avail      = ImGui::GetContentRegionAvail().y
                      - (n - 1) * ImGui::GetStyle().ItemSpacing.y;
-    float plotHeight = (avail / n) > 80.0f ? (avail / n) : 80.0f;
+    float plotHeight = (avail / n) > 60.0f ? (avail / n) : 60.0f;
 
     for (int i = 0; i < n; i++) {
         ImGui::PushID(i);
@@ -381,10 +387,10 @@ void ScopeView::render(MainViewModel& vm) {
                 computeAutoFitPlot(vm, i, /*allData=*/true);
                 plot->autoFitY = false;
             }
-            renderPlot(vm, *plot, i, plotHeight);
+            renderPlot(vm, *plot, i, plotHeight, /*isBottom=*/(i == n - 1));
         }
         ImGui::PopID();
-        if (i < n - 1) ImGui::Separator();
+        if (i < n - 1) ImGui::Spacing(); // thin gap instead of full separator
     }
 
     // Apply any pending zoom action NOW — after all EndPlot() calls.
@@ -407,7 +413,7 @@ void ScopeView::render(MainViewModel& vm) {
 
 // ─────────────────────── Per-plot rendering ───────────────────────────────
 void ScopeView::renderPlot(MainViewModel& vm, PlotArea& plot,
-                           int plotIndex, float plotHeight) {
+                           int plotIndex, float plotHeight, bool isBottom) {
     ScopeModel& scope = vm.scope();
 
     // Highlight border of the selected plot
@@ -417,15 +423,18 @@ void ScopeView::renderPlot(MainViewModel& vm, PlotArea& plot,
         ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2.0f);
     }
 
-    ImPlotFlags plotFlags = ImPlotFlags_NoMenus;
-    if (zoomMode_ != ZoomMode::None)
-        plotFlags |= ImPlotFlags_NoBoxSelect;  // disable ImPlot's own box-select
+    // Always disable ImPlot's built-in box-select; we implement our own zoom drag.
+    ImPlotFlags plotFlags = ImPlotFlags_NoMenus | ImPlotFlags_NoBoxSelect;
 
     // Estimate plot width BEFORE BeginPlot — GetPlotSize() locks the setup phase,
     // so all Setup* calls must precede any non-setup API.
     float plotWidthPx = ImGui::GetContentRegionAvail().x;
 
+    // Compact title area: reduce vertical inner padding from the default (10,10)
+    // to (10,3) so the title text sits closer to the plot content.
+    ImPlot::PushStyleVar(ImPlotStyleVar_PlotPadding, ImVec2(10.0f, 3.0f));
     bool plotOk = ImPlot::BeginPlot(plot.title.c_str(), ImVec2(-1, plotHeight), plotFlags);
+    ImPlot::PopStyleVar(); // PlotPadding
 
     // Pop style immediately — border rendering happens inside BeginPlot
     if (selected) {
@@ -435,11 +444,19 @@ void ScopeView::renderPlot(MainViewModel& vm, PlotArea& plot,
     if (!plotOk) return;
 
     // ── Axis setup ────────────────────────────────────────────────────────────
-    // X axis: linked so all plots pan/zoom together
-    ImPlot::SetupAxis(ImAxis_X1, "Time (s)");
+    // X axis: linked so all plots pan/zoom together.
+    // Only the bottom plot shows tick labels and the "Time (s)" title;
+    // upper plots suppress them to avoid redundant repetition.
+    {
+        ImPlotAxisFlags xFlags = isBottom
+            ? ImPlotAxisFlags_None
+            : (ImPlotAxisFlags_NoTickLabels | ImPlotAxisFlags_NoLabel);
+        ImPlot::SetupAxis(ImAxis_X1, isBottom ? "Time (s)" : nullptr, xFlags);
+    }
     ImPlot::SetupAxisLinks(ImAxis_X1, &xLinkMin_, &xLinkMax_);
     AxisFmtParams xFmt = computeAxisFmt(xLinkMin_, xLinkMax_, plotWidthPx);
-    ImPlot::SetupAxisFormat(ImAxis_X1, axisFormatterCallback, &xFmt);
+    if (isBottom)
+        ImPlot::SetupAxisFormat(ImAxis_X1, axisFormatterCallback, &xFmt);
 
     // Y axis: smart formatting adapts to value range.
     // No AutoFit flag — we control limits ourselves for accurate undo.
@@ -501,80 +518,148 @@ void ScopeView::renderPlot(MainViewModel& vm, PlotArea& plot,
         }
     }
 
-    // ── Zoom drag handling ─────────────────────────────────────────────────────
-    if (zoomMode_ != ZoomMode::None) {
-        // Show a hand cursor to signal that drag-zoom is active
-        if (ImPlot::IsPlotHovered())
+    // ── Auto-zoom drag (always active) ────────────────────────────────────────
+    // • Vertical   screen drag (|dy| ≥ |dx|) → H-zoom: select X / time range
+    // • Horizontal screen drag (|dy| < |dx|) → V-zoom: select Y range (this plot)
+    // • Short click (threshold not exceeded)  → select this plot
+    // • Drag on axis area                     → ImPlot native axis pan (unchanged)
+    //
+    // ImPlot processes its Pan input at EndPlot().  We set Pan = Middle when the
+    // mouse is in the plot body so ImPlot does not consume the drag; we restore
+    // Pan = Left when the mouse is on an axis so native axis-drag panning works.
+    {
+        const float kThresh   = 6.0f;
+        bool plotHov  = ImPlot::IsPlotHovered();
+        bool axisHov  = ImPlot::IsAxisHovered(ImAxis_X1) || ImPlot::IsAxisHovered(ImAxis_Y1);
+        bool lPressed = ImGui::IsMouseClicked(ImGuiMouseButton_Left, /*repeat=*/false);
+        bool lReleased= ImGui::IsMouseReleased(ImGuiMouseButton_Left);
+        ImVec2 mpos   = ImGui::GetMousePos();
+
+        // Per-plot InputMap override, evaluated just before this plot's EndPlot:
+        //   axis hover OR no interaction → Pan = Left  (axis drag pans normally)
+        //   plot body OR active drag     → Pan = Middle (we handle left drag)
+        {
+            bool suppressPan = autoDragActive_ || (plotHov && !axisHov);
+            ImPlot::GetInputMap().Pan =
+                suppressPan ? ImGuiMouseButton_Middle : ImGuiMouseButton_Left;
+        }
+
+        // Begin drag: left-press inside the plot body (not on an axis)
+        if (!autoDragActive_ && lPressed && plotHov && !axisHov) {
+            autoDragActive_    = true;
+            autoDragDirLocked_ = false;
+            autoDragIsH_       = false;
+            autoDragStartScr_  = mpos;
+            autoDragStartPlot_ = ImPlot::GetPlotMousePos();
+            autoDragPlotIdx_   = plotIndex;
+        }
+
+        // Hand cursor when hovering the plot body (signals zoom is ready)
+        if (plotHov && !axisHov && !autoDragActive_)
             ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
 
-        // Start drag on left-click in any plot
-        if (ImPlot::IsPlotHovered()
-            && ImGui::IsMouseClicked(ImGuiMouseButton_Left)
-            && !dragActive_) {
-            dragStartPlot_ = ImPlot::GetPlotMousePos();
-            dragPlotIdx_   = plotIndex;
-            dragActive_    = true;
+        // Active drag — originating plot processes direction lock, drawing, release
+        if (autoDragActive_ && autoDragPlotIdx_ == plotIndex) {
+            float adx = std::abs(mpos.x - autoDragStartScr_.x);
+            float ady = std::abs(mpos.y - autoDragStartScr_.y);
+
+            // Determine / update zoom direction with hysteresis to prevent flicker.
+            // Initial lock: whichever axis has larger displacement wins (past kThresh).
+            // Subsequent re-evaluation: need kHysteresis px advantage to switch mode.
+            //   V-zoom → H-zoom : adx > ady + kHysteresis
+            //   H-zoom → V-zoom : ady > adx + kHysteresis
+            const float kHysteresis = 20.0f;
+            if (!autoDragDirLocked_) {
+                if (adx > kThresh || ady > kThresh) {
+                    autoDragDirLocked_ = true;
+                    autoDragIsH_       = (ady >= adx);
+                }
+            } else {
+                if (!autoDragIsH_ && adx > ady + kHysteresis)
+                    autoDragIsH_ = true;   // V-zoom → H-zoom
+                else if (autoDragIsH_ && ady > adx + kHysteresis)
+                    autoDragIsH_ = false;  // H-zoom → V-zoom
+            }
+
+            if (autoDragDirLocked_) {
+                ImPlotPoint cur = ImPlot::GetPlotMousePos();
+                ImDrawList* dl  = ImPlot::GetPlotDrawList();
+                ImVec2 pPos     = ImPlot::GetPlotPos();
+                ImVec2 pSize    = ImPlot::GetPlotSize();
+
+                if (autoDragIsH_) {
+                    // H-zoom: vertical drag → X selection band
+                    ImVec2 pA = ImPlot::PlotToPixels(autoDragStartPlot_.x, 0.0);
+                    ImVec2 pB = ImPlot::PlotToPixels(cur.x,                0.0);
+                    float  xA = std::min(pA.x, pB.x), xB = std::max(pA.x, pB.x);
+                    dl->AddRectFilled({xA, pPos.y}, {xB, pPos.y + pSize.y},
+                                       IM_COL32(100, 150, 255, 50));
+                    dl->AddLine({xA, pPos.y}, {xA, pPos.y + pSize.y},
+                                 IM_COL32(100, 150, 255, 220), 1.5f);
+                    dl->AddLine({xB, pPos.y}, {xB, pPos.y + pSize.y},
+                                 IM_COL32(100, 150, 255, 220), 1.5f);
+                    ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+                } else {
+                    // V-zoom: horizontal drag → Y selection band (this plot only)
+                    ImVec2 pA = ImPlot::PlotToPixels(0.0, autoDragStartPlot_.y);
+                    ImVec2 pB = ImPlot::PlotToPixels(0.0, cur.y);
+                    float  yA = std::min(pA.y, pB.y), yB = std::max(pA.y, pB.y);
+                    dl->AddRectFilled({pPos.x, yA}, {pPos.x + pSize.x, yB},
+                                       IM_COL32(255, 150, 100, 50));
+                    dl->AddLine({pPos.x, yA}, {pPos.x + pSize.x, yA},
+                                 IM_COL32(255, 150, 100, 220), 1.5f);
+                    dl->AddLine({pPos.x, yB}, {pPos.x + pSize.x, yB},
+                                 IM_COL32(255, 150, 100, 220), 1.5f);
+                    ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+                }
+            }
+
+            // Release: commit zoom or (on short click) select this plot
+            // Do NOT modify xLinkMin_/xLinkMax_ or plotYStates_ directly here —
+            // ImPlot writes linked-axis values back at EndPlot(), which would
+            // overwrite them.  Store the intent in pendingZoom_ instead; it is
+            // applied after all EndPlot() calls at the bottom of render().
+            if (lReleased) {
+                if (autoDragDirLocked_) {
+                    ImPlotPoint cur = ImPlot::GetPlotMousePos();
+                    if (autoDragIsH_) {
+                        double lo = std::min(autoDragStartPlot_.x, cur.x);
+                        double hi = std::max(autoDragStartPlot_.x, cur.x);
+                        if (hi - lo > 1e-15)
+                            pendingZoom_ = {true, true, lo, hi, plotIndex};
+                    } else {
+                        double lo = std::min(autoDragStartPlot_.y, cur.y);
+                        double hi = std::max(autoDragStartPlot_.y, cur.y);
+                        if (hi - lo > 1e-15)
+                            pendingZoom_ = {true, false, lo, hi, plotIndex};
+                    }
+                } else {
+                    // Short click (no direction locked) → select this plot
+                    scope.setSelectedPlot(plotIndex);
+                }
+                autoDragActive_    = false;
+                autoDragPlotIdx_   = -1;
+                autoDragDirLocked_ = false;
+            }
         }
 
-        if (dragActive_) {
+        // Non-originating plots: draw the H-zoom X band so it spans all plots
+        if (autoDragActive_ && autoDragPlotIdx_ != plotIndex
+            && autoDragDirLocked_ && autoDragIsH_) {
             ImPlotPoint cur = ImPlot::GetPlotMousePos();
             ImDrawList* dl  = ImPlot::GetPlotDrawList();
-            ImVec2 plotPos  = ImPlot::GetPlotPos();
-            ImVec2 plotSize = ImPlot::GetPlotSize();
-
-            if (zoomMode_ == ZoomMode::HZoom) {
-                // Draw vertical selection band in EVERY plot (shared X axis)
-                ImVec2 pA = ImPlot::PlotToPixels(dragStartPlot_.x, 0.0);
-                ImVec2 pB = ImPlot::PlotToPixels(cur.x, 0.0);
-                float  xA = std::min(pA.x, pB.x);
-                float  xB = std::max(pA.x, pB.x);
-                float  y0 = plotPos.y, y1 = plotPos.y + plotSize.y;
-                dl->AddRectFilled({xA, y0}, {xB, y1}, IM_COL32(100, 150, 255,  50));
-                dl->AddLine({xA, y0}, {xA, y1}, IM_COL32(100, 150, 255, 220), 1.5f);
-                dl->AddLine({xB, y0}, {xB, y1}, IM_COL32(100, 150, 255, 220), 1.5f);
-
-            } else if (zoomMode_ == ZoomMode::VZoom && dragPlotIdx_ == plotIndex) {
-                // Draw horizontal selection band only in the dragged plot
-                ImVec2 pA = ImPlot::PlotToPixels(0.0, dragStartPlot_.y);
-                ImVec2 pB = ImPlot::PlotToPixels(0.0, cur.y);
-                float  yA = std::min(pA.y, pB.y);
-                float  yB = std::max(pA.y, pB.y);
-                float  x0 = plotPos.x, x1 = plotPos.x + plotSize.x;
-                dl->AddRectFilled({x0, yA}, {x1, yB}, IM_COL32(255, 150, 100,  50));
-                dl->AddLine({x0, yA}, {x1, yA}, IM_COL32(255, 150, 100, 220), 1.5f);
-                dl->AddLine({x0, yB}, {x1, yB}, IM_COL32(255, 150, 100, 220), 1.5f);
-            }
-
-            // Capture drag end on mouse release — handled only in the originating plot.
-            // We do NOT modify xLinkMin_/xLinkMax_ or plotYStates_ here because
-            // ImPlot writes linked-axis values back at EndPlot(), which would
-            // immediately overwrite any changes made inside BeginPlot/EndPlot.
-            // Instead we store the intent in pendingZoom_ and apply it AFTER
-            // all EndPlot() calls (see the bottom of render()).
-            if (dragPlotIdx_ == plotIndex
-                && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
-                if (zoomMode_ == ZoomMode::HZoom) {
-                    double lo = std::min(dragStartPlot_.x, cur.x);
-                    double hi = std::max(dragStartPlot_.x, cur.x);
-                    if (hi - lo > 1e-15)
-                        pendingZoom_ = {true, true, lo, hi, plotIndex};
-                } else if (zoomMode_ == ZoomMode::VZoom) {
-                    double lo = std::min(dragStartPlot_.y, cur.y);
-                    double hi = std::max(dragStartPlot_.y, cur.y);
-                    if (hi - lo > 1e-15)
-                        pendingZoom_ = {true, false, lo, hi, plotIndex};
-                }
-                dragActive_  = false;
-                dragPlotIdx_ = -1;
-            }
+            ImVec2 pPos     = ImPlot::GetPlotPos();
+            ImVec2 pSize    = ImPlot::GetPlotSize();
+            ImVec2 pA = ImPlot::PlotToPixels(autoDragStartPlot_.x, 0.0);
+            ImVec2 pB = ImPlot::PlotToPixels(cur.x,                0.0);
+            float  xA = std::min(pA.x, pB.x), xB = std::max(pA.x, pB.x);
+            dl->AddRectFilled({xA, pPos.y}, {xB, pPos.y + pSize.y},
+                               IM_COL32(100, 150, 255, 50));
+            dl->AddLine({xA, pPos.y}, {xA, pPos.y + pSize.y},
+                         IM_COL32(100, 150, 255, 220), 1.5f);
+            dl->AddLine({xB, pPos.y}, {xB, pPos.y + pSize.y},
+                         IM_COL32(100, 150, 255, 220), 1.5f);
         }
-    }
-
-    // ── Click to select (only when not in zoom mode) ──────────────────────────
-    if (zoomMode_ == ZoomMode::None
-        && ImPlot::IsPlotHovered()
-        && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-        scope.setSelectedPlot(plotIndex);
     }
 
     // ── Right-click context menu ──────────────────────────────────────────────
@@ -591,7 +676,7 @@ void ScopeView::renderPlot(MainViewModel& vm, PlotArea& plot,
         ImDrawList* dl  = ImPlot::GetPlotDrawList();
         ImVec2 plotPos  = ImPlot::GetPlotPos();
         ImVec2 plotSize = ImPlot::GetPlotSize();
-        if (xFmt.useScaledSci) {
+        if (isBottom && xFmt.useScaledSci) {
             ImVec2 ts = ImGui::CalcTextSize(xFmt.annotation);
             dl->AddText({plotPos.x + plotSize.x - ts.x - 4,
                          plotPos.y + plotSize.y - ts.y - 2},
@@ -608,9 +693,15 @@ void ScopeView::renderPlot(MainViewModel& vm, PlotArea& plot,
     // GetPlotLimits() returns what ImPlot is actually displaying this frame
     // (including any scroll-wheel zoom or pan the user did with the mouse).
     // We cache this so pushSnapshot() always captures the real current state.
-    {
+    //
+    // Guard: if a plot was inserted or removed during this frame (e.g. from
+    // the context menu inside this very renderPlot call), the plotYStates_
+    // vector has already been correctly updated by insertPlot/removePlot
+    // (with forceSet=true and the right yMin/yMax).  Writing GetPlotLimits()
+    // here would overwrite those correct values with stale data from whichever
+    // plot happened to be at plotIndex before the structural change.
+    if (!plotStructureChanged_) {
         ImPlotRect lim = ImPlot::GetPlotLimits(ImAxis_X1, ImAxis_Y1);
-        // Only update if we did not force-set this frame (forceSet was cleared above)
         plotYStates_[plotIndex].yMin = lim.Y.Min;
         plotYStates_[plotIndex].yMax = lim.Y.Max;
     }
@@ -623,11 +714,11 @@ void ScopeView::renderPlotContextMenu(MainViewModel& vm, int plotIndex) {
     ScopeModel& scope = vm.scope();
 
     if (ImGui::MenuItem("Insert Plot Above"))
-        scope.insertPlot(plotIndex - 1);
+        insertPlot(scope, plotIndex - 1);
     if (ImGui::MenuItem("Insert Plot Below"))
-        scope.insertPlot(plotIndex);
+        insertPlot(scope, plotIndex);
     if (ImGui::MenuItem("Delete Plot", nullptr, false, scope.plotCount() > 1))
-        scope.removePlot(plotIndex);
+        removePlot(scope, plotIndex);
     if (ImGui::MenuItem("Auto-Fit This Plot")) {
         pushSnapshot(scope.plotCount());
         computeAutoFitPlot(vm, plotIndex);

@@ -75,5 +75,32 @@ void SettingsView::render(MainViewModel& vm) {
         ImGui::BulletText("%s", sig.name.c_str());
     }
 
+    // ── Diagnostics log ────────────────────────────────────────────────────────
+    ImGui::Separator();
+    if (ImGui::CollapsingHeader("Diagnostics", ImGuiTreeNodeFlags_DefaultOpen)) {
+        const auto& log = vm.diagLog();
+        bool newEvents = (log.size() != lastDiagCount_);
+        lastDiagCount_ = log.size();
+
+        if (ImGui::Button("Clear##diag")) {
+            vm.clearDiagLog();
+            lastDiagCount_ = 0;
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("(%zu entries)", log.size());
+
+        ImGui::BeginChild("##diaglog", ImVec2(0.0f, 180.0f), true,
+                          ImGuiWindowFlags_HorizontalScrollbar);
+        for (const auto& ev : log) {
+            ImVec4 col = (ev.level == DiagEvent::Warning) ? ImVec4(1.0f, 0.9f, 0.2f, 1.0f) :
+                         (ev.level == DiagEvent::Error)   ? ImVec4(1.0f, 0.3f, 0.3f, 1.0f) :
+                                                             ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
+            ImGui::TextColored(col, "%s", ev.message.c_str());
+        }
+        if (newEvents)
+            ImGui::SetScrollHereY(1.0f);
+        ImGui::EndChild();
+    }
+
     ImGui::End();
 }

@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <unordered_map>
 
 // A single signal bound to a plot
 struct MuxEntry {
@@ -82,6 +83,10 @@ private:
     int selectedPlot_ = 0;
     size_t bufferCapacity_ = 20000;
     static int colorIndex_;
+
+    // Rescue cache: preserves buffer data when a plot is deleted so that
+    // signals can still be re-added to new plots with historical waveform data.
+    std::unordered_map<std::string, ScrollingBuffer> signalCache_;
 
     std::string makePlotTitle(int index);
 };
