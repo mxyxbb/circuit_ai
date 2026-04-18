@@ -33,6 +33,7 @@ struct SchematicComp {
     std::string instanceName;
     ImVec2 pos{0.0f, 0.0f};          // canvas position (centre)
     int  rotation = 0;               // 0/1/2/3 = 0°/90°/180°/270° CW
+    bool mirrorX  = false;           // horizontal flip (applied before rotation)
     std::vector<std::string> paramValues; // by ParamDef index
 };
 
@@ -77,6 +78,10 @@ public:
 
     // SPICE netlist generation — returns "" if schematic is empty
     std::string generateNetlist(const SchematicSimConfig& cfg) const;
+
+    // Persist / restore schematic (custom .sch text format)
+    bool saveToFile(const std::string& path) const;
+    bool loadFromFile(const std::string& path);
 
     void clear();
 

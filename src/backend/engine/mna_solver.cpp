@@ -50,8 +50,26 @@ void MNASolver::stampExtraRhs(size_t absExtra, double val) {
     b_(absExtra) += val;
 }
 
+void MNASolver::applyGmin(double gmin) {
+    for (size_t i = 0; i < n_; ++i)
+        A_(i, i) += gmin;
+}
+
 const Eigen::VectorXd& MNASolver::solve() {
-    x_ = A_.partialPivLu().solve(b_);
+    // Jacobi (diagonal) preconditioning: transform A*x = b into
+    // (D*A*D)*y = D*b and recover x = D*y, where D[i] = 1/sqrt(|A[i,i]|).
+    // This maps all diagonal entries to 1.0, reducing the condition number
+    // from ~1e15 (caused by capacitor gEq >> switch G_off at small dt) to O(1).
+    size_t sz = n_ + m_;
+    Eigen::VectorXd scale(sz);
+    for (size_t i = 0; i < sz; ++i) {
+        double d = std::abs(A_(i, i));
+        scale(i) = (d > 1e-20) ? 1.0 / std::sqrt(d) : 1.0;
+    }
+    // Evaluate in two steps to avoid Eigen expression-template issues.
+    Eigen::MatrixXd As = (scale.asDiagonal() * A_).eval() * scale.asDiagonal();
+    Eigen::VectorXd bs = scale.cwiseProduct(b_);
+    x_ = scale.cwiseProduct(As.partialPivLu().solve(bs));
     return x_;
 }
 

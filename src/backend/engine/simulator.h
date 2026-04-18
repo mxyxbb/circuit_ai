@@ -70,4 +70,5 @@ private:
     SPSCRingBuffer<SimSample, 524288> ringBuffer_;
     SPSCRingBuffer<DiagEvent, 256>   diagRing_;   // power-of-2; drop-newest on overflow
     size_t stepCount_ = 0;
+    int beStepsRemaining_ = 0;  // steps remaining in forced-BE mode after a switch event
 };

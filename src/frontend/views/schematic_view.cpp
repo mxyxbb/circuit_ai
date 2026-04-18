@@ -1,3 +1,15 @@
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <commdlg.h>
+#pragma comment(lib, "comdlg32.lib")
+#endif
+
 #include "views/schematic_view.h"
 #include "view_model/main_view_model.h"
 #include "view_model/schematic_model.h"
@@ -6,6 +18,33 @@
 #include <cmath>
 #include <cstring>
 #include <algorithm>
+#include <unordered_map>
+
+// ── Win32 file dialog helpers ──────────────────────────────────────────────
+#ifdef _WIN32
+static bool pickOpenPath(char* buf, int n) {
+    OPENFILENAMEA ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.lpstrFilter = "CircuitAI Schematic\0*.sch\0All Files\0*.*\0\0";
+    ofn.lpstrFile   = buf;
+    ofn.nMaxFile    = static_cast<DWORD>(n);
+    ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    ofn.lpstrDefExt = "sch";
+    buf[0] = '\0';
+    return GetOpenFileNameA(&ofn) != 0;
+}
+static bool pickSavePath(char* buf, int n) {
+    OPENFILENAMEA ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.lpstrFilter = "CircuitAI Schematic\0*.sch\0All Files\0*.*\0\0";
+    ofn.lpstrFile   = buf;
+    ofn.nMaxFile    = static_cast<DWORD>(n);
+    ofn.Flags       = OFN_OVERWRITEPROMPT;
+    ofn.lpstrDefExt = "sch";
+    buf[0] = '\0';
+    return GetSaveFileNameA(&ofn) != 0;
+}
+#endif
 
 SchematicView::SchematicView() : BaseView("Schematic") {}
 
@@ -13,8 +52,7 @@ SchematicView::SchematicView() : BaseView("Schematic") {}
 
 const char* SchematicView::polaritySymbol(const std::string& pinLabel) {
     if (pinLabel == "P" || pinLabel == "A") return "+";
-    if (pinLabel == "N" || pinLabel == "K") return "\xe2\x88\x92"; // unicode minus
-    return nullptr;
+    return nullptr;  // only show "+" on positive pin
 }
 
 float SchematicView::distPointToSegment(ImVec2 pt, ImVec2 a, ImVec2 b) {
@@ -49,18 +87,21 @@ ImVec2 SchematicView::snapGrid(ImVec2 pos, float g) {
 ImVec2 SchematicView::rotateOff(ImVec2 off, int rot) {
     float x = off.x, y = off.y;
     switch (((rot % 4) + 4) % 4) {
-        case 1: return {  y, -x };   // 90° CW
+        case 1: return { -y,  x };   // 90° CW  (screen Y-down: top→right)
         case 2: return { -x, -y };   // 180°
-        case 3: return { -y,  x };   // 270° CW
+        case 3: return {  y, -x };   // 270° CW
         default:return {  x,  y };   // 0°
     }
 }
 
-// Canvas position of pin pi on comp, accounting for rotation
+// Canvas position of pin pi on comp, accounting for mirrorX and rotation
 ImVec2 SchematicView::pinCanvasPos(const SchematicComp& comp, int pi) {
     const CompTypeDef* td = SchematicModel::findCompType(comp.typeId);
     if (!td || pi >= (int)td->pins.size()) return comp.pos;
-    ImVec2 roff = rotateOff(td->pins[pi].offset, comp.rotation);
+    float ox = td->pins[pi].offset.x;
+    float oy = td->pins[pi].offset.y;
+    if (comp.mirrorX) ox = -ox;
+    ImVec2 roff = rotateOff({ox, oy}, comp.rotation);
     return { comp.pos.x + roff.x, comp.pos.y + roff.y };
 }
 
@@ -76,14 +117,48 @@ void SchematicView::render(MainViewModel& vm) {
     SchematicModel& sch = vm.schematic();
 
     // ── Toolbar ────────────────────────────────────────────────────────────
+    if (ioStatusTimer_ > 0.f) ioStatusTimer_ -= ImGui::GetIO().DeltaTime;
+
     if (ImGui::Button("Build & Run")) vm.buildFromSchematic();
     ImGui::SameLine();
     if (ImGui::Button("Clear")) {
         sch.clear();
         selectedCompId_ = selectedWireId_ = propEditCompId_ = movingCompId_ = -1;
+        multiSelectedIds_.clear(); multiMoveOrigPos_.clear(); selBoxActive_ = false;
         wiringActive_ = false;
     }
     ImGui::SameLine();
+#ifdef _WIN32
+    if (ImGui::Button("Save")) {
+        char path[512] = {};
+        if (pickSavePath(path, sizeof(path))) {
+            bool ok = sch.saveToFile(path);
+            std::snprintf(ioStatus_, sizeof(ioStatus_), ok ? "Saved." : "Save failed!");
+            ioStatusTimer_ = 2.5f;
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Load")) {
+        char path[512] = {};
+        if (pickOpenPath(path, sizeof(path))) {
+            bool ok = sch.loadFromFile(path);
+            if (ok) {
+                selectedCompId_ = selectedWireId_ = propEditCompId_ = movingCompId_ = -1;
+                multiSelectedIds_.clear(); multiMoveOrigPos_.clear(); selBoxActive_ = false;
+                wiringActive_ = false;
+            }
+            std::snprintf(ioStatus_, sizeof(ioStatus_), ok ? "Loaded." : "Load failed!");
+            ioStatusTimer_ = 2.5f;
+        }
+    }
+    if (ioStatusTimer_ > 0.f) {
+        ImGui::SameLine();
+        bool fail = (std::strstr(ioStatus_, "failed") != nullptr);
+        ImGui::TextColored(fail ? ImVec4(1.f,0.35f,0.35f,1.f)
+                                : ImVec4(0.3f,1.f,0.45f,1.f), "%s", ioStatus_);
+    }
+    ImGui::SameLine();
+#endif
     ImGui::TextDisabled("|");
     ImGui::SameLine();
     ImGui::TextDisabled("dt:");
@@ -101,7 +176,7 @@ void SchematicView::render(MainViewModel& vm) {
     if (wiringActive_) {
         ImGui::TextColored({0.3f,1.0f,0.5f,1.0f}, "[WIRING — click pin to finish / click canvas for waypoint / Esc cancel]");
     } else {
-        ImGui::TextDisabled("LClick=sel/wire  R=rotate  RDrag=pan  Scroll=zoom  Del=delete");
+        ImGui::TextDisabled("LClick=sel/wire  R=rotate  X=mirror  Ctrl+C=copy  RDrag=pan  Scroll=zoom  Del=delete  LDrag(empty)=multisel  Ctrl+LClick=add sel");
     }
     ImGui::Separator();
 
@@ -164,12 +239,65 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
         wiringActive_ = false; wireFromCompId_ = -1; wireWaypoints_.clear();
     }
 
-    // ── R key: rotate selected component ──────────────────────────────────
-    if (selectedCompId_ != -1 && ImGui::IsKeyPressed(ImGuiKey_R)) {
-        SchematicComp* c = sch.findComp(selectedCompId_);
-        if (c) {
-            c->rotation = (c->rotation + 1) % 4;
-            propEditCompId_ = -1;  // force prop buffer refresh
+    // ── R key: rotate selected component(s) ───────────────────────────────
+    if (ImGui::IsKeyPressed(ImGuiKey_R)) {
+        auto targets = multiSelectedIds_.empty()
+            ? std::vector<int>{selectedCompId_} : multiSelectedIds_;
+        for (int cid : targets) {
+            SchematicComp* c = sch.findComp(cid);
+            if (c) c->rotation = (c->rotation + 1) % 4;
+        }
+        propEditCompId_ = -1;
+    }
+
+    // ── X key: mirror selected component(s) ───────────────────────────────
+    if (ImGui::IsKeyPressed(ImGuiKey_X)) {
+        auto targets = multiSelectedIds_.empty()
+            ? std::vector<int>{selectedCompId_} : multiSelectedIds_;
+        for (int cid : targets) {
+            SchematicComp* c = sch.findComp(cid);
+            if (c) c->mirrorX = !c->mirrorX;
+        }
+        propEditCompId_ = -1;
+    }
+
+    // ── Ctrl+C: copy selected component(s) ────────────────────────────────
+    if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C)) {
+        std::vector<int> toCopy = multiSelectedIds_.empty()
+            ? std::vector<int>{selectedCompId_} : multiSelectedIds_;
+        toCopy.erase(std::remove(toCopy.begin(), toCopy.end(), -1), toCopy.end());
+        if (!toCopy.empty()) {
+            std::unordered_map<int,int> idMap;
+            std::vector<int> newIds;
+            for (int cid : toCopy) {
+                SchematicComp* src = sch.findComp(cid);
+                if (!src) continue;
+                ImVec2 newPos = snapGrid({src->pos.x + 40.f, src->pos.y + 40.f});
+                int newId = sch.addComp(src->typeId, newPos);
+                SchematicComp* dst = sch.findComp(newId);
+                if (dst) {
+                    dst->rotation    = src->rotation;
+                    dst->mirrorX     = src->mirrorX;
+                    dst->paramValues = src->paramValues;
+                }
+                idMap[cid] = newId;
+                newIds.push_back(newId);
+            }
+            // Copy wires connecting two copied components
+            auto wireSnap = sch.wires();
+            for (const auto& w : wireSnap) {
+                if (idMap.count(w.fromCompId) && idMap.count(w.toCompId))
+                    sch.addWire(idMap[w.fromCompId], w.fromPinIdx,
+                                idMap[w.toCompId],   w.toPinIdx, w.waypoints);
+            }
+            if (newIds.size() == 1) {
+                selectedCompId_  = newIds[0];
+                multiSelectedIds_.clear();
+            } else {
+                multiSelectedIds_ = newIds;
+                selectedCompId_   = newIds[0];
+            }
+            propEditCompId_ = -1;
         }
     }
 
@@ -242,21 +370,51 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
                 if (comp.rotation % 2 == 1) std::swap(bx, by);
                 if (mousePt.x >= comp.pos.x - bx && mousePt.x <= comp.pos.x + bx &&
                     mousePt.y >= comp.pos.y - by && mousePt.y <= comp.pos.y + by) {
-                    selectedCompId_  = comp.id;
-                    movingCompId_    = comp.id;
-                    moveStartCanvas_ = mousePt;
-                    moveCompOrigPos_ = comp.pos;
-                    wiringActive_    = false;
+                    wiringActive_ = false;
                     wireWaypoints_.clear();
-                    // Refresh property buffers if needed
-                    if (propEditCompId_ != comp.id) {
-                        propEditCompId_ = comp.id;
-                        strncpy(propNameBuf_, comp.instanceName.c_str(), sizeof(propNameBuf_)-1);
-                        propNameBuf_[sizeof(propNameBuf_)-1] = '\0';
-                        for (int i = 0; i < 8; ++i) propBufs_[i][0] = '\0';
-                        for (int i = 0; i < (int)comp.paramValues.size() && i < 8; ++i) {
-                            strncpy(propBufs_[i], comp.paramValues[i].c_str(), sizeof(propBufs_[i])-1);
-                            propBufs_[i][sizeof(propBufs_[i])-1] = '\0';
+
+                    if (ImGui::GetIO().KeyCtrl) {
+                        // Ctrl+click: toggle in multi-select without starting move
+                        auto it = std::find(multiSelectedIds_.begin(), multiSelectedIds_.end(), comp.id);
+                        if (it != multiSelectedIds_.end()) {
+                            multiSelectedIds_.erase(it);
+                            if (selectedCompId_ == comp.id)
+                                selectedCompId_ = multiSelectedIds_.empty() ? -1 : multiSelectedIds_[0];
+                        } else {
+                            multiSelectedIds_.push_back(comp.id);
+                            selectedCompId_ = comp.id;
+                        }
+                        propEditCompId_ = -1;
+                    } else {
+                        // Normal click: if already in multi-select, start multi-move
+                        bool inMulti = !multiSelectedIds_.empty() &&
+                            std::find(multiSelectedIds_.begin(), multiSelectedIds_.end(), comp.id)
+                                != multiSelectedIds_.end();
+                        if (!inMulti) {
+                            // Single-select this component
+                            multiSelectedIds_.clear();
+                            selectedCompId_ = comp.id;
+                        }
+                        movingCompId_    = comp.id;
+                        moveStartCanvas_ = mousePt;
+                        moveCompOrigPos_ = comp.pos;
+                        // Store original positions of all selected for multi-move
+                        multiMoveOrigPos_.clear();
+                        auto& toMove = inMulti ? multiSelectedIds_ : std::vector<int>{comp.id};
+                        for (int cid : toMove) {
+                            SchematicComp* mc = sch.findComp(cid);
+                            if (mc) multiMoveOrigPos_.push_back({cid, mc->pos});
+                        }
+                        // Refresh property buffers
+                        if (propEditCompId_ != comp.id) {
+                            propEditCompId_ = comp.id;
+                            strncpy(propNameBuf_, comp.instanceName.c_str(), sizeof(propNameBuf_)-1);
+                            propNameBuf_[sizeof(propNameBuf_)-1] = '\0';
+                            for (int i = 0; i < 8; ++i) propBufs_[i][0] = '\0';
+                            for (int i = 0; i < (int)comp.paramValues.size() && i < 8; ++i) {
+                                strncpy(propBufs_[i], comp.paramValues[i].c_str(), sizeof(propBufs_[i])-1);
+                                propBufs_[i][sizeof(propBufs_[i])-1] = '\0';
+                            }
                         }
                     }
                     hitBody = true;
@@ -276,50 +434,94 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
                 if (!ca || !cb) continue;
                 ImVec2 pa = pinCanvasPos(*ca, wire.fromPinIdx);
                 ImVec2 pb = pinCanvasPos(*cb, wire.toPinIdx);
-                // Test all segments: fromPin → waypoints → toPin
                 std::vector<ImVec2> path;
                 path.push_back(pa);
                 for (const auto& wp : wire.waypoints) path.push_back(wp);
                 path.push_back(pb);
                 for (size_t i = 1; i < path.size(); ++i) {
                     float d = distPointToSegment(mousePt, path[i-1], path[i]);
-                    if (d < bestDist) {
-                        bestDist = d;
-                        bestWireId = wire.id;
-                    }
+                    if (d < bestDist) { bestDist = d; bestWireId = wire.id; }
                 }
             }
             if (bestWireId != -1) {
-                selectedWireId_  = bestWireId;
-                selectedCompId_  = -1;
-                propEditCompId_  = -1;
+                selectedWireId_   = bestWireId;
+                selectedCompId_   = -1;
+                multiSelectedIds_.clear();
+                propEditCompId_   = -1;
             } else {
-                selectedWireId_  = -1;
-                selectedCompId_  = -1;
-                propEditCompId_  = -1;
-                wiringActive_    = false;
+                // Start rubber-band selection box
+                selBoxActive_       = true;
+                selBoxStartCanvas_  = mousePt;
+                if (!ImGui::GetIO().KeyCtrl) {
+                    selectedWireId_   = -1;
+                    selectedCompId_   = -1;
+                    multiSelectedIds_.clear();
+                    propEditCompId_   = -1;
+                }
+                wiringActive_ = false;
                 wireWaypoints_.clear();
             }
         } else if (hitBody) {
-            selectedWireId_ = -1;  // component selected → clear wire selection
+            selectedWireId_ = -1;
         }
     }
 
-    // ── Drag to move ───────────────────────────────────────────────────────
+    // ── Rubber-band selection box (finish on mouse release) ────────────────
+    if (selBoxActive_ && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        ImVec2 bMin = { std::min(selBoxStartCanvas_.x, mousePt.x),
+                        std::min(selBoxStartCanvas_.y, mousePt.y) };
+        ImVec2 bMax = { std::max(selBoxStartCanvas_.x, mousePt.x),
+                        std::max(selBoxStartCanvas_.y, mousePt.y) };
+        bool anyAdded = false;
+        for (auto& comp : sch.comps()) {
+            if (comp.pos.x >= bMin.x && comp.pos.x <= bMax.x &&
+                comp.pos.y >= bMin.y && comp.pos.y <= bMax.y) {
+                if (std::find(multiSelectedIds_.begin(), multiSelectedIds_.end(), comp.id)
+                    == multiSelectedIds_.end())
+                    multiSelectedIds_.push_back(comp.id);
+                anyAdded = true;
+            }
+        }
+        if (anyAdded) {
+            selectedCompId_ = multiSelectedIds_[0];
+            propEditCompId_ = -1;
+        }
+        if (multiSelectedIds_.size() == 1) {
+            selectedCompId_ = multiSelectedIds_[0];
+            multiSelectedIds_.clear();
+        }
+        selBoxActive_ = false;
+    }
+
+    // ── Drag to move (single or multi) ────────────────────────────────────
     if (movingCompId_ != -1) {
         if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
             float dx = mousePt.x - moveStartCanvas_.x;
             float dy = mousePt.y - moveStartCanvas_.y;
-            SchematicComp* c = sch.findComp(movingCompId_);
-            if (c) c->pos = snapGrid({ moveCompOrigPos_.x + dx, moveCompOrigPos_.y + dy });
+            if (!multiMoveOrigPos_.empty()) {
+                for (auto& [cid, origPos] : multiMoveOrigPos_) {
+                    SchematicComp* c = sch.findComp(cid);
+                    if (c) c->pos = snapGrid({origPos.x + dx, origPos.y + dy});
+                }
+            } else {
+                SchematicComp* c = sch.findComp(movingCompId_);
+                if (c) c->pos = snapGrid({moveCompOrigPos_.x + dx, moveCompOrigPos_.y + dy});
+            }
         } else {
             movingCompId_ = -1;
+            multiMoveOrigPos_.clear();
         }
     }
 
     // ── Delete ─────────────────────────────────────────────────────────────
     if (ImGui::IsKeyPressed(ImGuiKey_Delete)) {
-        if (selectedCompId_ != -1) {
+        if (!multiSelectedIds_.empty()) {
+            for (int cid : multiSelectedIds_) sch.removeComp(cid);
+            multiSelectedIds_.clear();
+            selectedCompId_ = propEditCompId_ = movingCompId_ = -1;
+            multiMoveOrigPos_.clear();
+            wiringActive_ = false;
+        } else if (selectedCompId_ != -1) {
             sch.removeComp(selectedCompId_);
             selectedCompId_ = propEditCompId_ = movingCompId_ = -1;
             wiringActive_ = false;
@@ -367,6 +569,217 @@ void SchematicView::drawWires(ImDrawList* dl, MainViewModel& vm, ImVec2 origin) 
     }
 }
 
+// ── Per-type standard symbol drawing ──────────────────────────────────────
+
+void SchematicView::drawCompSymbol(ImDrawList* dl, const SchematicComp& comp,
+                                   const CompTypeDef& /*td*/, ImVec2 ctr, bool sel)
+{
+    static constexpr float PI = 3.14159265358979323846f;
+    ImU32 col   = sel ? IM_COL32(255,210,50,255) : IM_COL32(110,155,220,255);
+    float thick = (sel ? 2.2f : 1.5f) * zoom_;
+    float z     = zoom_;
+
+    // Rotate + optional mirror → screen coords
+    auto sc = [&](float ox, float oy) -> ImVec2 {
+        float mx = comp.mirrorX ? -ox : ox;
+        ImVec2 r = rotateOff({mx, oy}, comp.rotation);
+        return {ctr.x + r.x * z, ctr.y + r.y * z};
+    };
+
+    const std::string& id = comp.typeId;
+
+    // ── Resistor ──────────────────────────────────────────────────────────
+    if (id == "R") {
+        dl->AddLine(sc(-40,0), sc(-14,0), col, thick);
+        dl->AddLine(sc(+14,0), sc(+40,0), col, thick);
+        dl->AddLine(sc(-14,-7), sc(+14,-7), col, thick);
+        dl->AddLine(sc(+14,-7), sc(+14,+7), col, thick);
+        dl->AddLine(sc(+14,+7), sc(-14,+7), col, thick);
+        dl->AddLine(sc(-14,+7), sc(-14,-7), col, thick);
+    }
+    // ── Capacitor ─────────────────────────────────────────────────────────
+    else if (id == "C") {
+        dl->AddLine(sc(-40,0), sc(-5,0),  col, thick);
+        dl->AddLine(sc(+5,0),  sc(+40,0), col, thick);
+        dl->AddLine(sc(-5,-12), sc(-5,+12), col, thick*1.5f);
+        dl->AddLine(sc(+5,-12), sc(+5,+12), col, thick*1.5f);
+    }
+    // ── Inductor ──────────────────────────────────────────────────────────
+    else if (id == "L") {
+        dl->AddLine(sc(-40,0), sc(-24,0), col, thick);
+        dl->AddLine(sc(+24,0), sc(+40,0), col, thick);
+        const int N = 14;
+        float bumpCx[4] = {-18.f, -6.f, +6.f, +18.f};
+        for (int b = 0; b < 4; ++b) {
+            float cx = bumpCx[b];
+            for (int k = 0; k <= N; ++k) {
+                float a = PI + (float)k / N * PI;   // π→2π: upward bumps
+                dl->PathLineTo(sc(cx + 6.f*cosf(a), 6.f*sinf(a)));
+            }
+        }
+        dl->PathStroke(col, 0, thick);
+    }
+    // ── Voltage sources — circle stays upright, only leads rotate ─────────
+    else if (id == "V_DC" || id == "V_SIN" || id == "V_SQUARE" || id == "V_STEP") {
+        dl->AddCircle(ctr, 18.f*z, col, 32, thick);
+        dl->AddLine(sc(-40,0), sc(-18,0), col, thick);
+        dl->AddLine(sc(+18,0), sc(+40,0), col, thick);
+
+        if (id == "V_DC") {
+            // "+" only, fixed screen orientation
+            dl->AddLine({ctr.x - 9*z, ctr.y      }, {ctr.x - 3*z, ctr.y      }, col, thick);
+            dl->AddLine({ctr.x - 6*z, ctr.y - 3*z}, {ctr.x - 6*z, ctr.y + 3*z}, col, thick);
+        } else if (id == "V_SIN") {
+            const int NS = 16;
+            for (int k = 0; k <= NS; ++k) {
+                float t  = (float)k / NS;
+                dl->PathLineTo({ctr.x + (-12.f + 24.f*t)*z,
+                                ctr.y + (-6.f*sinf(2.f*PI*t))*z});
+            }
+            dl->PathStroke(col, 0, thick);
+        } else if (id == "V_SQUARE") {
+            dl->PathLineTo({ctr.x - 12*z, ctr.y - 5*z});
+            dl->PathLineTo({ctr.x -  4*z, ctr.y - 5*z});
+            dl->PathLineTo({ctr.x -  4*z, ctr.y + 5*z});
+            dl->PathLineTo({ctr.x +  4*z, ctr.y + 5*z});
+            dl->PathLineTo({ctr.x +  4*z, ctr.y - 5*z});
+            dl->PathLineTo({ctr.x + 12*z, ctr.y - 5*z});
+            dl->PathStroke(col, 0, thick);
+        } else { // V_STEP
+            dl->PathLineTo({ctr.x - 12*z, ctr.y + 5*z});
+            dl->PathLineTo({ctr.x -  4*z, ctr.y + 5*z});
+            dl->PathLineTo({ctr.x -  4*z, ctr.y - 5*z});
+            dl->PathLineTo({ctr.x + 12*z, ctr.y - 5*z});
+            dl->PathStroke(col, 0, thick);
+        }
+    }
+    // ── Current source — circle upright, arrow fixed horizontal ───────────
+    else if (id == "I") {
+        dl->AddCircle(ctr, 18.f*z, col, 32, thick);
+        dl->AddLine(sc(-40,0), sc(-18,0), col, thick);
+        dl->AddLine(sc(+18,0), sc(+40,0), col, thick);
+        dl->AddLine({ctr.x + 8*z, ctr.y}, {ctr.x - 8*z, ctr.y}, col, thick);
+        dl->AddTriangleFilled({ctr.x - 8*z, ctr.y},
+                              {ctr.x - 4*z, ctr.y - 4*z},
+                              {ctr.x - 4*z, ctr.y + 4*z}, col);
+    }
+    // ── Diode ─────────────────────────────────────────────────────────────
+    else if (id == "D") {
+        dl->AddLine(sc(-40,0), sc(-12,0), col, thick);
+        dl->AddLine(sc(+12,0), sc(+40,0), col, thick);
+        dl->PathLineTo(sc(-12,-10));
+        dl->PathLineTo(sc(+12,  0));
+        dl->PathLineTo(sc(-12,+10));
+        dl->PathStroke(col, ImDrawFlags_Closed, thick);
+        dl->AddLine(sc(+12,-12), sc(+12,+12), col, thick);
+    }
+    // ── Switch: G/GRef on left, D/S vertically on right ───────────────────
+    else if (id == "S") {
+        // Gate terminal (left) — G at pin(-40,-20), GRef at pin(-40,+20)
+        dl->AddLine(sc(-40,-20), sc( -5,-20), col, thick);   // G lead
+        dl->AddLine(sc(-40,+20), sc( -5,+20), col, thick);   // GRef lead
+        dl->AddLine(sc( -5,-24), sc( -5,+24), col, thick);   // gate bar
+        dl->AddLine(sc( -5,  0), sc( +5,  0), col, thick);   // control line
+        // D-S contacts (right) — D at pin(+40,-20), S at pin(+40,+20)
+        dl->AddLine(sc(+40,-20), sc(+16,-20), col, thick);   // D lead
+        dl->AddLine(sc(+40,+20), sc(+16,+20), col, thick);   // S lead
+        dl->AddCircleFilled(sc(+16,-20), 3.f*z, col);         // D contact dot
+        dl->AddCircleFilled(sc(+16,+20), 3.f*z, col);         // S contact dot
+        dl->AddLine(sc(+16,-20), sc(+8,+8), col, thick);      // open switch arm
+    }
+    // ── Transformer 2-winding (turns ratio label) ─────────────────────────
+    else if (id == "TX") {
+        ImU32 coreCol = sel ? IM_COL32(255,210,50,180) : IM_COL32(150,180,230,200);
+        dl->AddLine(sc(-5,-18), sc(-5,+18), coreCol, thick*0.8f);
+        dl->AddLine(sc(+5,-18), sc(+5,+18), coreCol, thick*0.8f);
+        dl->AddLine(sc(-40,-20), sc(-22,-18), col, thick);
+        dl->AddLine(sc(-40,+20), sc(-22,+18), col, thick);
+        dl->AddLine(sc(+40,-20), sc(+22,-18), col, thick);
+        dl->AddLine(sc(+40,+20), sc(+22,+18), col, thick);
+        const int NC = 12;
+        float primY[3] = {-12.f, 0.f, +12.f};
+        for (int b = 0; b < 3; ++b) {
+            float yc = primY[b];
+            for (int k = 0; k <= NC; ++k) {
+                float a = -PI/2.f - (float)k/NC*PI;
+                dl->PathLineTo(sc(-22.f + 6.f*cosf(a), yc + 6.f*sinf(a)));
+            }
+        }
+        dl->PathStroke(col, 0, thick);
+        for (int b = 0; b < 3; ++b) {
+            float yc = primY[b];
+            for (int k = 0; k <= NC; ++k) {
+                float a = -PI/2.f + (float)k/NC*PI;
+                dl->PathLineTo(sc(+22.f + 6.f*cosf(a), yc + 6.f*sinf(a)));
+            }
+        }
+        dl->PathStroke(col, 0, thick);
+        // Turns ratio "n1:n2" centred upright
+        if (comp.paramValues.size() >= 2) {
+            char turns[40];
+            std::snprintf(turns, sizeof(turns), "%s:%s",
+                          comp.paramValues[0].c_str(), comp.paramValues[1].c_str());
+            ImVec2 ts = ImGui::CalcTextSize(turns);
+            dl->AddText({ctr.x - ts.x*0.5f, ctr.y - ts.y*0.5f},
+                        sel ? IM_COL32(255,210,50,255) : IM_COL32(180,210,255,255), turns);
+        }
+    }
+    // ── Transformer 3-winding ─────────────────────────────────────────────
+    else if (id == "TX3") {
+        ImU32 coreCol = sel ? IM_COL32(255,210,50,180) : IM_COL32(150,180,230,200);
+        dl->AddLine(sc(-5,-30), sc(-5,+30), coreCol, thick*0.8f);
+        dl->AddLine(sc(+5,-30), sc(+5,+30), coreCol, thick*0.8f);
+        // Lead wires
+        dl->AddLine(sc(-40,-20), sc(-22,-18), col, thick);   // P1
+        dl->AddLine(sc(-40,+20), sc(-22,+18), col, thick);   // N1
+        dl->AddLine(sc(+40,-30), sc(+22,-30), col, thick);   // P2
+        dl->AddLine(sc(+40,-10), sc(+22,-10), col, thick);   // N2
+        dl->AddLine(sc(+40,+10), sc(+22,+10), col, thick);   // P3
+        dl->AddLine(sc(+40,+30), sc(+22,+30), col, thick);   // N3
+        const int NC = 12, NS2 = 10;
+        // Primary: 3 left-pointing bumps (y -18..+18)
+        float primY3[3] = {-12.f, 0.f, +12.f};
+        for (int b = 0; b < 3; ++b) {
+            float yc = primY3[b];
+            for (int k = 0; k <= NC; ++k) {
+                float a = -PI/2.f - (float)k/NC*PI;
+                dl->PathLineTo(sc(-22.f + 6.f*cosf(a), yc + 6.f*sinf(a)));
+            }
+        }
+        dl->PathStroke(col, 0, thick);
+        // Secondary 1: 2 right-pointing bumps r=5 (y -30..-10)
+        float sec1Y[2] = {-25.f, -15.f};
+        for (int b = 0; b < 2; ++b) {
+            float yc = sec1Y[b];
+            for (int k = 0; k <= NS2; ++k) {
+                float a = -PI/2.f + (float)k/NS2*PI;
+                dl->PathLineTo(sc(+22.f + 5.f*cosf(a), yc + 5.f*sinf(a)));
+            }
+        }
+        dl->PathStroke(col, 0, thick);
+        // Secondary 2: 2 right-pointing bumps r=5 (y +10..+30)
+        float sec2Y[2] = {+15.f, +25.f};
+        for (int b = 0; b < 2; ++b) {
+            float yc = sec2Y[b];
+            for (int k = 0; k <= NS2; ++k) {
+                float a = -PI/2.f + (float)k/NS2*PI;
+                dl->PathLineTo(sc(+22.f + 5.f*cosf(a), yc + 5.f*sinf(a)));
+            }
+        }
+        dl->PathStroke(col, 0, thick);
+        // Turns label "n1:n2:n3"
+        if (comp.paramValues.size() >= 3) {
+            char turns[48];
+            std::snprintf(turns, sizeof(turns), "%s:%s:%s",
+                          comp.paramValues[0].c_str(), comp.paramValues[1].c_str(),
+                          comp.paramValues[2].c_str());
+            ImVec2 ts = ImGui::CalcTextSize(turns);
+            dl->AddText({ctr.x - ts.x*0.5f, ctr.y - ts.y*0.5f},
+                        sel ? IM_COL32(255,210,50,255) : IM_COL32(180,210,255,255), turns);
+        }
+    }
+}
+
 // ── Component drawing ──────────────────────────────────────────────────────
 
 void SchematicView::drawComponents(ImDrawList* dl, MainViewModel& vm, ImVec2 origin) {
@@ -375,7 +788,10 @@ void SchematicView::drawComponents(ImDrawList* dl, MainViewModel& vm, ImVec2 ori
     for (const auto& comp : sch.comps()) {
         const CompTypeDef* td = SchematicModel::findCompType(comp.typeId);
         if (!td) continue;
-        bool sel = (comp.id == selectedCompId_);
+        bool sel = (comp.id == selectedCompId_) ||
+                   (!multiSelectedIds_.empty() &&
+                    std::find(multiSelectedIds_.begin(), multiSelectedIds_.end(), comp.id)
+                        != multiSelectedIds_.end());
         ImVec2 ctr = c2s(comp.pos, origin);
 
         // ── GND symbol ────────────────────────────────────────────────────
@@ -401,33 +817,14 @@ void SchematicView::drawComponents(ImDrawList* dl, MainViewModel& vm, ImVec2 ori
             continue;
         }
 
-        // ── Generic box body (body half-size swaps on 90°/270°) ───────────
+        // ── Standard circuit symbol ───────────────────────────────────────
+        drawCompSymbol(dl, comp, *td, ctr, sel);
+
+        // Body half-size kept for label placement only (bodyHalfSize unchanged)
         float bx = td->bodyHalfSize.x, by = td->bodyHalfSize.y;
         if (comp.rotation % 2 == 1) std::swap(bx, by);
         float bxs = bx * zoom_, bys = by * zoom_;
-        ImVec2 tl = {ctr.x-bxs, ctr.y-bys}, br = {ctr.x+bxs, ctr.y+bys};
-
-        ImU32 bodyFill   = IM_COL32(40, 70, 110, 255);
-        ImU32 bodyBorder = sel ? IM_COL32(255,210,50,255) : IM_COL32(110,155,220,255);
-        float thick      = sel ? 2.0f*zoom_ : 1.2f*zoom_;
-        dl->AddRectFilled(tl, br, bodyFill, 3.0f*zoom_);
-        dl->AddRect(tl, br, bodyBorder, 3.0f*zoom_, 0, thick);
-
-        // Type abbreviation centred in body
-        const char* abbr = td->id.c_str();
-        if (comp.typeId=="V_DC"||comp.typeId=="V_SQUARE"||
-            comp.typeId=="V_SIN"||comp.typeId=="V_STEP") abbr="V";
-        ImVec2 ts = ImGui::CalcTextSize(abbr);
-        dl->AddText({ctr.x-ts.x*.5f, ctr.y-ts.y*.5f}, IM_COL32(200,225,255,255), abbr);
-
-        // Rotation indicator: small arc/triangle for 90°/180°/270°
-        if (comp.rotation != 0) {
-            char rot_label[4];
-            snprintf(rot_label, sizeof(rot_label), "%d°", comp.rotation * 90);
-            ImVec2 rl = ImGui::CalcTextSize(rot_label);
-            dl->AddText({ctr.x+bxs-rl.x-2*zoom_, ctr.y-bys+1*zoom_},
-                        IM_COL32(160,160,80,200), rot_label);
-        }
+        (void)bxs;
 
         // Instance name (+ first param) below/beside body
         char lbl[80];
@@ -438,49 +835,51 @@ void SchematicView::drawComponents(ImDrawList* dl, MainViewModel& vm, ImVec2 ori
         ImVec2 ls = ImGui::CalcTextSize(lbl);
         dl->AddText({ctr.x-ls.x*.5f, ctr.y+bys+2*zoom_}, IM_COL32(170,200,170,255), lbl);
 
-        // ── Pins (rotated positions) ──────────────────────────────────────
+        // ── Pins (mirrorX + rotated positions) ───────────────────────────
         for (int pi = 0; pi < (int)td->pins.size(); ++pi) {
-            ImVec2 roff     = rotateOff(td->pins[pi].offset, comp.rotation);
-            ImVec2 pinCanvas= {comp.pos.x+roff.x, comp.pos.y+roff.y};
-            ImVec2 pinScr   = c2s(pinCanvas, origin);
-
-            // Wire stub: from body edge to pin
-            float dx = roff.x, dy = roff.y;
-            float t  = 1.0f;
-            if (fabsf(dx) > 0.0f) t = std::min(t, bx / fabsf(dx));
-            if (fabsf(dy) > 0.0f) t = std::min(t, by / fabsf(dy));
-            ImVec2 edgeScr = c2s({comp.pos.x+dx*t, comp.pos.y+dy*t}, origin);
-            dl->AddLine(edgeScr, pinScr, IM_COL32(100,140,190,200), 1.2f*zoom_);
+            ImVec2 pinCanvas = pinCanvasPos(comp, pi);
+            ImVec2 pinScr    = c2s(pinCanvas, origin);
 
             // Pin circle
             bool isStart = (wiringActive_ && wireFromCompId_==comp.id && wireFromPinIdx_==pi);
             dl->AddCircleFilled(pinScr, 4.0f*zoom_,
                                 isStart ? IM_COL32(50,255,100,255) : IM_COL32(80,200,120,255));
 
-            // Polarity label (+ or −)
+            // Polarity "+" label (accounts for mirrorX + rotation)
             const char* polSym = polaritySymbol(td->pins[pi].label);
             if (polSym) {
-                ImVec2 pinOff = td->pins[pi].offset;  // unrotated
-                float len = sqrtf(pinOff.x*pinOff.x + pinOff.y*pinOff.y);
+                float ox = td->pins[pi].offset.x;
+                float oy = td->pins[pi].offset.y;
+                if (comp.mirrorX) ox = -ox;
+                float len = sqrtf(ox*ox + oy*oy);
                 if (len > 1.0f) {
-                    ImVec2 dir = { pinOff.x / len, pinOff.y / len };
-                    ImVec2 labelOff = { pinOff.x + dir.x * 12.0f, pinOff.y + dir.y * 12.0f };
+                    ImVec2 dir = { ox / len, oy / len };
+                    ImVec2 labelOff    = { ox + dir.x * 12.0f, oy + dir.y * 12.0f };
                     ImVec2 labelRotOff = rotateOff(labelOff, comp.rotation);
-                    ImVec2 labelCanvasPos = { comp.pos.x + labelRotOff.x, comp.pos.y + labelRotOff.y };
-                    ImVec2 labelScr = c2s(labelCanvasPos, origin);
+                    ImVec2 labelCanvas = { comp.pos.x + labelRotOff.x, comp.pos.y + labelRotOff.y };
+                    ImVec2 labelScr    = c2s(labelCanvas, origin);
                     ImVec2 ts = ImGui::CalcTextSize(polSym);
-                    bool isPlus = (td->pins[pi].label == "P" || td->pins[pi].label == "A");
-                    ImU32 polCol = isPlus ? IM_COL32(255,120,120,255) : IM_COL32(120,120,255,255);
-                    dl->AddText({labelScr.x - ts.x*0.5f, labelScr.y - ts.y*0.5f}, polCol, polSym);
+                    dl->AddText({labelScr.x - ts.x*0.5f, labelScr.y - ts.y*0.5f},
+                                IM_COL32(255,120,120,255), polSym);
                 }
             }
         }
     }
 }
 
-// ── Rubber-band wire ────────────────────────────────────────────────────────
+// ── Rubber-band wire / selection box ────────────────────────────────────────
 
 void SchematicView::drawRubberBand(ImDrawList* dl, MainViewModel& vm, ImVec2 origin) const {
+    // Selection box
+    if (selBoxActive_) {
+        ImVec2 bStart = c2s(selBoxStartCanvas_, origin);
+        ImVec2 bEnd   = ImGui::GetMousePos();
+        float x0 = std::min(bStart.x, bEnd.x), y0 = std::min(bStart.y, bEnd.y);
+        float x1 = std::max(bStart.x, bEnd.x), y1 = std::max(bStart.y, bEnd.y);
+        dl->AddRectFilled({x0,y0}, {x1,y1}, IM_COL32(100,150,255,30));
+        dl->AddRect({x0,y0}, {x1,y1}, IM_COL32(100,150,255,200), 0.f, 0, 1.0f);
+    }
+
     if (!wiringActive_) return;
     const SchematicComp* c = vm.schematic().findComp(wireFromCompId_);
     if (!c) return;

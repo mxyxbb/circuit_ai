@@ -30,11 +30,16 @@ public:
 
     void reset() override { state_ = OFF; }
 
+    void saveState() override    { savedState_ = state_; }
+    void restoreState() override { state_ = savedState_; }
+    bool stateChangedSinceLastSave() const override { return state_ != savedState_; }
+
 private:
     enum State { OFF, ON, BODY_DIODE };
     std::string name_;
     int nd_, ns_, ng_, ngr_;
-    State state_ = OFF;
+    State state_      = OFF;
+    State savedState_ = OFF;
 
     static constexpr double R_ON             = 1e-3;
     static constexpr double BODY_R_ON        = 2e-3;   // body diode forward resistance

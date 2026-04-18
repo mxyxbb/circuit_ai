@@ -37,10 +37,15 @@ public:
         return changed;
     }
 
+    void saveState() override    { savedIsOn_ = isOn_; }
+    void restoreState() override { isOn_ = savedIsOn_; }
+    bool stateChangedSinceLastSave() const override { return isOn_ != savedIsOn_; }
+
 private:
     std::string name_;
     int na_, nk_;
     bool isOn_;
+    bool savedIsOn_ = false;
     static constexpr double R_ON  = 1e-3;
     static constexpr double R_OFF = 1e9;
     static constexpr double V_THRESHOLD = 1e-6;

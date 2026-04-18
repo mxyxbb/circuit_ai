@@ -26,4 +26,14 @@ public:
         (void)x; (void)extraOff; return 0.0;
     }
     virtual void reset() {}
+    virtual void setUseBE(bool) {}
+
+    // ZC bisection support: save/restore full component state (history + switch position).
+    // Called by Simulator before and during zero-crossing detection.
+    virtual void saveState() {}
+    virtual void restoreState() {}
+
+    // Returns true if the current (post-solve) state differs from the last saveState().
+    // Only nonlinear components (switches, diodes) need to override this.
+    virtual bool stateChangedSinceLastSave() const { return false; }
 };

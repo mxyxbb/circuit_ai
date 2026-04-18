@@ -1,6 +1,7 @@
 #include "view_model/schematic_model.h"
 #include <algorithm>
 #include <sstream>
+#include <fstream>
 #include <set>
 #include <functional>
 #include <cmath>
@@ -57,14 +58,21 @@ static const std::vector<CompTypeDef> s_compTypes = {
       {24,14} },
 
     { "S",        "Switch",         "S",
-      { {"D",{0,-40}}, {"S",{0,40}}, {"G",{-40,0}}, {"GRef",{40,0}} },
+      { {"D",{+40,-20}}, {"S",{+40,+20}}, {"G",{-40,-20}}, {"GRef",{-40,+20}} },
       {},
       {24,24} },
 
     { "TX",       "Transformer",    "TX",
       { {"P1",{-40,-20}}, {"N1",{-40,20}}, {"P2",{40,-20}}, {"N2",{40,20}} },
-      { {"ratio","10"} },
+      { {"turns1","10"}, {"turns2","1"} },
       {24,24} },
+
+    { "TX3",      "Transformer 3W", "TX",
+      { {"P1",{-40,-20}}, {"N1",{-40,+20}},
+        {"P2",{+40,-30}}, {"N2",{+40,-10}},
+        {"P3",{+40,+10}}, {"N3",{+40,+30}} },
+      { {"turns1","10"}, {"turns2","1"}, {"turns3","1"} },
+      {28,36} },
 
     { "GND",      "Ground",         "",
       { {"GND",{0,0}} },
@@ -287,7 +295,12 @@ std::string SchematicModel::generateNetlist(const SchematicSimConfig& cfg) const
         } else if (comp.typeId == "TX") {
             oss << n << ' ' << nets[0] << ' ' << nets[1]
                 << ' ' << nets[2] << ' ' << nets[3]
-                << " ratio=" << p(0) << '\n';
+                << " turns1=" << p(0) << " turns2=" << p(1) << '\n';
+        } else if (comp.typeId == "TX3") {
+            oss << n << ' ' << nets[0] << ' ' << nets[1]
+                << ' ' << nets[2] << ' ' << nets[3]
+                << ' ' << nets[4] << ' ' << nets[5]
+                << " turns1=" << p(0) << " turns2=" << p(1) << " turns3=" << p(2) << '\n';
         }
     }
 
@@ -297,4 +310,132 @@ std::string SchematicModel::generateNetlist(const SchematicSimConfig& cfg) const
     oss << ".END\n";
 
     return oss.str();
+}
+
+// ── Schematic file I/O (.sch format) ─────────────────────────────────────────
+//
+// Format:
+//   CSCH1                               — magic/version header
+//   S <dt> <tEnd>                       — sim config
+//   C <id> <typeId> <name> <x> <y> <rot> [p1|p2|...]   — component
+//   W <id> <fc> <fp> <tc> <tp> [wx wy ...]              — wire + waypoints
+
+bool SchematicModel::saveToFile(const std::string& path) const {
+    std::ofstream f(path);
+    if (!f) return false;
+
+    f << "CSCH2\n";
+    f << "S " << simCfg.dt << ' ' << simCfg.tEnd << '\n';
+
+    for (const auto& c : comps_) {
+        f << 'C' << ' ' << c.id << ' ' << c.typeId << ' ' << c.instanceName
+          << ' ' << c.pos.x << ' ' << c.pos.y << ' ' << c.rotation
+          << ' ' << (c.mirrorX ? 1 : 0);
+        if (!c.paramValues.empty()) {
+            f << ' ';
+            for (size_t i = 0; i < c.paramValues.size(); ++i) {
+                if (i > 0) f << '|';
+                f << c.paramValues[i];
+            }
+        }
+        f << '\n';
+    }
+
+    for (const auto& w : wires_) {
+        f << 'W' << ' ' << w.id
+          << ' ' << w.fromCompId << ' ' << w.fromPinIdx
+          << ' ' << w.toCompId   << ' ' << w.toPinIdx;
+        for (const auto& wp : w.waypoints)
+            f << ' ' << wp.x << ' ' << wp.y;
+        f << '\n';
+    }
+
+    return f.good();
+}
+
+bool SchematicModel::loadFromFile(const std::string& path) {
+    std::ifstream f(path);
+    if (!f) return false;
+
+    std::string line;
+    if (!std::getline(f, line)) return false;
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    bool hasMirrorX = (line == "CSCH2");
+    if (line != "CSCH1" && line != "CSCH2") return false;
+
+    clear();
+    int maxCompId = 0, maxWireId = 0;
+
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) continue;
+
+        std::istringstream ss(line);
+        char tag;
+        ss >> tag;
+
+        if (tag == 'S') {
+            std::string dt, tEnd;
+            if (ss >> dt >> tEnd) {
+                std::strncpy(simCfg.dt,   dt.c_str(),   sizeof(simCfg.dt)   - 1);
+                std::strncpy(simCfg.tEnd, tEnd.c_str(), sizeof(simCfg.tEnd) - 1);
+                simCfg.dt  [sizeof(simCfg.dt)   - 1] = '\0';
+                simCfg.tEnd[sizeof(simCfg.tEnd) - 1] = '\0';
+            }
+        } else if (tag == 'C') {
+            SchematicComp c;
+            if (!(ss >> c.id >> c.typeId >> c.instanceName
+                     >> c.pos.x >> c.pos.y >> c.rotation))
+                continue;
+            if (hasMirrorX) {
+                int mx = 0;
+                ss >> mx;
+                c.mirrorX = (mx != 0);
+            }
+            // Remaining: param values joined by '|'
+            std::string rest;
+            if (std::getline(ss, rest)) {
+                size_t s = rest.find_first_not_of(" \t");
+                if (s != std::string::npos) {
+                    std::istringstream ps(rest.substr(s));
+                    std::string tok;
+                    while (std::getline(ps, tok, '|'))
+                        c.paramValues.push_back(tok);
+                }
+            }
+            if (c.id > maxCompId) maxCompId = c.id;
+            comps_.push_back(std::move(c));
+        } else if (tag == 'W') {
+            SchematicWire w;
+            if (!(ss >> w.id >> w.fromCompId >> w.fromPinIdx
+                     >> w.toCompId >> w.toPinIdx))
+                continue;
+            float wx, wy;
+            while (ss >> wx >> wy)
+                w.waypoints.push_back({wx, wy});
+            if (w.id > maxWireId) maxWireId = w.id;
+            wires_.push_back(std::move(w));
+        }
+    }
+
+    nextCompId_ = maxCompId + 1;
+    nextWireId_ = maxWireId + 1;
+
+    // Rebuild prefix counters so subsequent addComp names don't collide
+    for (const auto& c : comps_) {
+        const CompTypeDef* td = findCompType(c.typeId);
+        if (!td || td->prefix.empty()) continue;
+        const std::string& pfx = td->prefix;
+        if (c.instanceName.size() > pfx.size() &&
+            c.instanceName.compare(0, pfx.size(), pfx) == 0)
+        {
+            try {
+                int num = std::stoi(c.instanceName.substr(pfx.size()));
+                int& cnt = prefixCounts_[pfx];
+                if (num > cnt) cnt = num;
+            } catch (...) {}
+        }
+    }
+
+    return true;
 }

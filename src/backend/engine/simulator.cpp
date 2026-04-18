@@ -107,6 +107,7 @@ void Simulator::reset() {
     stop();
     t_.store(0.0);
     stepCount_ = 0;
+    beStepsRemaining_ = 0;
     // Reset component internal states (inductor iPrev, capacitor vPrev, etc.)
     if (circuit_) {
         for (const auto& comp : circuit_->components()) {
@@ -143,49 +144,99 @@ void Simulator::runLoop() {
 }
 
 bool Simulator::step() {
-    constexpr int MAX_ITER = 20;
+    constexpr int MAX_ITER     = 20;
+    constexpr int MAX_ZC_BISECT = 8;  // dt / 2^8 = dt/256 crossing accuracy
     const double dt = config_.dt;
     double t = t_.load();
 
-    // Iterative solve for nonlinear components
-    bool converged = true;   // hoisted: reflects result of the last iteration
-    const Eigen::VectorXd* xp = nullptr;
-    for (int iter = 0; iter < MAX_ITER; ++iter) {
-        solver_->clear();
+    bool useBE = (beStepsRemaining_ > 0);
+    for (const auto& comp : circuit_->components())
+        comp->setUseBE(useBE);
 
-        size_t ci = 0;
-        for (const auto& comp : circuit_->components()) {
-            comp->stamp(*solver_, dt, t, compExtraAbs_[ci]);
-            ci++;
-        }
+    // Save component state (histories + switch positions) at time t.
+    // Used by ZC bisection to restore state for each trial step.
+    for (const auto& comp : circuit_->components())
+        comp->saveState();
 
-        const auto& x = solver_->solve();
-        xp = &x;
-
-        // Check convergence for nonlinear components
-        converged = true;
-        ci = 0;
-        for (const auto& comp : circuit_->components()) {
-            if (comp->updateState(x, compExtraAbs_[ci])) {
-                converged = false;
+    // Inner convergence loop: stamp → solve → updateState until nonlinear
+    // components converge or MAX_ITER is reached.
+    // Returns true if convergence succeeded (all components settled with no further state change).
+    // NOTE: intermediate iterations may flip states; only the FINAL converged state matters.
+    auto innerSolve = [&](double stepDt, double atT) -> bool {
+        bool converged = true;
+        for (int iter = 0; iter < MAX_ITER; ++iter) {
+            solver_->clear();
+            solver_->applyGmin(1e-12);
+            size_t ci = 0;
+            for (const auto& comp : circuit_->components())
+                comp->stamp(*solver_, stepDt, atT, compExtraAbs_[ci++]);
+            const auto& x = solver_->solve();
+            converged = true;
+            ci = 0;
+            for (const auto& comp : circuit_->components()) {
+                if (comp->updateState(x, compExtraAbs_[ci++]))
+                    converged = false;
             }
-            ci++;
+            if (converged) break;
         }
-        if (converged) break;
+        if (!converged) {
+            char buf[80];
+            snprintf(buf, sizeof(buf),
+                     "t=%.3e: convergence failed after %d iterations", atT, MAX_ITER);
+            diagRing_.push({DiagEvent::Warning, atT, buf});
+        }
+        return converged;
+    };
+
+    // Helper: did the final state of any nonlinear component differ from saveState()?
+    // Uses stateChangedSinceLastSave() so only PERSISTENT state changes trigger ZC.
+    auto finalStateChanged = [&]() -> bool {
+        for (const auto& comp : circuit_->components())
+            if (comp->stateChangedSinceLastSave()) return true;
+        return false;
+    };
+
+    // Full step to t + dt
+    bool converged = innerSolve(dt, t);
+    // Only trigger ZC bisection when:
+    //   1. The solve converged (no chattering), AND
+    //   2. The final state truly differs from the saved initial state.
+    // Chattering (MAX_ITER exhausted) is treated as "no reliable crossing" — just proceed.
+    bool anyStateChange = converged && finalStateChanged();
+    double stepDt = dt;
+
+    if (anyStateChange) {
+        // Zero-crossing bisection: narrow [dtLo, dtHi] to locate t_zc to dt/2^MAX_ZC_BISECT.
+        // dtLo = largest sub-step with no net state change (pre-crossing)
+        // dtHi = smallest sub-step with net state change  (post-crossing ≈ t_zc)
+        double dtLo = 0.0, dtHi = dt;
+        for (int b = 0; b < MAX_ZC_BISECT; ++b) {
+            double dtMid = (dtLo + dtHi) * 0.5;
+            for (const auto& comp : circuit_->components()) {
+                comp->restoreState();
+                comp->setUseBE(true);
+            }
+            bool midConverged = innerSolve(dtMid, t);
+            // If solve didn't converge at this sub-step, treat as "no crossing yet"
+            if (midConverged && finalStateChanged()) dtHi = dtMid;
+            else                                     dtLo = dtMid;
+        }
+
+        // Final solve at dtHi: this is the step that includes the crossing.
+        for (const auto& comp : circuit_->components()) {
+            comp->restoreState();
+            comp->setUseBE(true);
+        }
+        innerSolve(dtHi, t);
+        stepDt = dtHi;
+
+        beStepsRemaining_ = 3;
+    } else if (beStepsRemaining_ > 0) {
+        --beStepsRemaining_;
     }
 
-    // Emit diagnostic warning if MAX_ITER was exhausted without convergence
-    if (!converged) {
-        char buf[80];
-        snprintf(buf, sizeof(buf),
-                 "t=%.3e: convergence failed after %d iterations", t, MAX_ITER);
-        diagRing_.push({DiagEvent::Warning, t, buf});
-    }
+    const auto& x = solver_->lastSolution();
 
-    // xp points to the final solution from the last solve()
-    const auto& x = *xp;
-
-    // Emit diagnostic error if the solution contains NaN or Inf values
     if (!x.allFinite()) {
         char buf[96];
         snprintf(buf, sizeof(buf),
@@ -195,10 +246,8 @@ bool Simulator::step() {
 
     // Commit history for storage components
     size_t ci = 0;
-    for (const auto& comp : circuit_->components()) {
-        comp->commitHistory(x, compExtraAbs_[ci]);
-        ci++;
-    }
+    for (const auto& comp : circuit_->components())
+        comp->commitHistory(x, compExtraAbs_[ci++]);
 
     // Sample data for probes
     if (stepCount_ % static_cast<size_t>(config_.sample_ratio) == 0) {
@@ -215,25 +264,18 @@ bool Simulator::step() {
                 sample.values[i] = x(pm.absIndex);
                 break;
             case ProbeMapEntry::ResistorCurrent: {
-                // Use the component's getBranchCurrent which returns 0 for base class.
-                // For resistors, we need to compute (Vnp - Vnn)/R.
-                // Since getBranchCurrent returns 0 for resistors, we compute directly.
-                size_t ci = pm.absIndex;
+                size_t idx = pm.absIndex;
                 const auto& comps = circuit_->components();
-                if (ci < comps.size()) {
-                    sample.values[i] = comps[ci]->getBranchCurrent(x, compExtraAbs_[ci]);
-                }
+                if (idx < comps.size())
+                    sample.values[i] = comps[idx]->getBranchCurrent(x, compExtraAbs_[idx]);
                 break;
             }
             }
         }
-        // SPSC ring buffer: only the main thread may call pop().
-        // If the buffer is full, drop this sample rather than calling pop() here,
-        // which would create a second concurrent consumer and corrupt data.
         ringBuffer_.push(sample);
     }
 
-    t_ = t + dt;
+    t_ = t + stepDt;
     stepCount_++;
     return true;
 }

@@ -34,12 +34,16 @@ public:
 
     const Eigen::VectorXd& solve();
 
+    // Tikhonov regularization: stamps gmin on each node diagonal to prevent floating nodes.
+    void applyGmin(double gmin = 1e-12);
+
     double getNodeVoltage(int node) const;     // 1-based
     double getExtraCurrent(size_t absExtra) const; // absolute index
     size_t matrixSize() const { return n_ + m_; }
     size_t nodeCount() const { return n_; }
     const Eigen::MatrixXd& getA() const { return A_; }
     const Eigen::VectorXd& getB() const { return b_; }
+    const Eigen::VectorXd& lastSolution() const { return x_; }
 
 private:
     size_t n_ = 0, m_ = 0;

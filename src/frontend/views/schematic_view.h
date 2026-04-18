@@ -3,6 +3,7 @@
 #include <imgui.h>
 #include <string>
 #include <vector>
+#include <utility>
 
 class SchematicView : public BaseView {
 public:
@@ -21,6 +22,12 @@ private:
     ImVec2 moveStartCanvas_{0, 0};  // canvas pos when move began
     ImVec2 moveCompOrigPos_{0, 0};  // component's original position
 
+    // ── Multi-select ─────────────────────────────────────────────────────────
+    std::vector<int> multiSelectedIds_;                   // additional selected comp ids
+    bool   selBoxActive_      = false;
+    ImVec2 selBoxStartCanvas_ = {0, 0};
+    std::vector<std::pair<int,ImVec2>> multiMoveOrigPos_; // compId → original pos for multi-move
+
     // ── Wire drawing ────────────────────────────────────────────────────────
     bool wiringActive_   = false;
     int  wireFromCompId_ = -1;
@@ -34,6 +41,10 @@ private:
     int  propEditCompId_ = -1;
     char propNameBuf_[64]  = {};
     char propBufs_[8][64]  = {};    // up to 8 params per component
+
+    // ── Save / Load status ───────────────────────────────────────────────────
+    char  ioStatus_[64] = {};
+    float ioStatusTimer_ = 0.f;
 
     // ── Coordinate helpers ───────────────────────────────────────────────────
     ImVec2 s2c(ImVec2 screenPt, ImVec2 origin) const;   // screen → canvas
@@ -53,6 +64,8 @@ private:
     void drawGrid(ImDrawList* dl, ImVec2 origin, ImVec2 size) const;
     void drawWires(ImDrawList* dl, MainViewModel& vm, ImVec2 origin) const;
     void drawComponents(ImDrawList* dl, MainViewModel& vm, ImVec2 origin);
+    void drawCompSymbol(ImDrawList* dl, const struct SchematicComp& comp,
+                        const struct CompTypeDef& td, ImVec2 ctr, bool sel);
     void drawRubberBand(ImDrawList* dl, MainViewModel& vm, ImVec2 origin) const;
     void renderProperties(MainViewModel& vm);
 };

@@ -66,16 +66,34 @@ bool MainViewModel::loadNetlist(const std::string& filepath) {
 }
 
 void MainViewModel::autoPopulateScope() {
-    // Clear existing scope content
+    size_t bufCap = scope_.getBufferCapacity();  // preserve capacity set before this call
     scope_ = ScopeModel();
-
-    // Add all probe signals to the first plot
-    PlotArea* plot = scope_.getPlot(0);
-    if (!plot) return;
-
+    scope_.setBufferCapacity(bufCap);
     ScopeModel::resetColorIndex();
+
+    // Detect whether both voltage and current probes are present.
+    // When mixed, put V signals in plot 0 ("Voltage") and I signals in plot 1 ("Current")
+    // so each plot can auto-fit its own Y scale independently.
+    bool hasV = false, hasI = false;
+    for (const auto& p : probes_) {
+        if (p.type == SignalInfo::NodeVoltage) hasV = true;
+        else                                   hasI = true;
+    }
+
+    if (hasV && hasI) {
+        scope_.insertPlot(0);  // adds plot 1 after the default plot 0
+        PlotArea* pV = scope_.getPlot(0);
+        PlotArea* pI = scope_.getPlot(1);
+        if (pV) pV->title = "Voltage";
+        if (pI) pI->title = "Current";
+    }
+
     for (const auto& probe : probes_) {
-        plot->addSignal(probe.name, ScopeModel::nextColor(), scope_.getBufferCapacity());
+        bool isCurrent = (probe.type == SignalInfo::BranchCurrent);
+        int plotIdx = (hasV && hasI && isCurrent) ? 1 : 0;
+        PlotArea* plot = scope_.getPlot(plotIdx);
+        if (plot)
+            plot->addSignal(probe.name, ScopeModel::nextColor(), scope_.getBufferCapacity());
     }
 }
 
