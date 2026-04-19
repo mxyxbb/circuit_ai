@@ -305,8 +305,14 @@ std::string SchematicModel::generateNetlist(const SchematicSimConfig& cfg) const
     }
 
     oss << ".TRAN " << cfg.dt << ' ' << cfg.tEnd << '\n';
+    // Probe all node voltages
     for (int net : usedNets)
         oss << ".PROBE V(" << net << ")\n";
+    // Probe branch current of every non-GND component
+    for (const auto& comp : comps_) {
+        if (comp.typeId == "GND") continue;
+        oss << ".PROBE I(" << comp.instanceName << ")\n";
+    }
     oss << ".END\n";
 
     return oss.str();

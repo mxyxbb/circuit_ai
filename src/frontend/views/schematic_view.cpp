@@ -626,9 +626,11 @@ void SchematicView::drawCompSymbol(ImDrawList* dl, const SchematicComp& comp,
         dl->AddLine(sc(+18,0), sc(+40,0), col, thick);
 
         if (id == "V_DC") {
-            // "+" only, fixed screen orientation
-            dl->AddLine({ctr.x - 9*z, ctr.y      }, {ctr.x - 3*z, ctr.y      }, col, thick);
-            dl->AddLine({ctr.x - 6*z, ctr.y - 3*z}, {ctr.x - 6*z, ctr.y + 3*z}, col, thick);
+            // "+" near P pin (rotates with component)
+            dl->AddLine(sc(-12, 0), sc(-6,  0), col, thick);   // horizontal bar of +
+            dl->AddLine(sc(-9, -3), sc(-9, +3), col, thick);   // vertical bar of +
+            // "−" near N pin (rotates with component)
+            dl->AddLine(sc(+6, 0), sc(+12, 0), col, thick);    // minus bar
         } else if (id == "V_SIN") {
             const int NS = 16;
             for (int k = 0; k <= NS; ++k) {
@@ -686,6 +688,27 @@ void SchematicView::drawCompSymbol(ImDrawList* dl, const SchematicComp& comp,
         dl->AddCircleFilled(sc(+16,-20), 3.f*z, col);         // D contact dot
         dl->AddCircleFilled(sc(+16,+20), 3.f*z, col);         // S contact dot
         dl->AddLine(sc(+16,-20), sc(+8,+8), col, thick);      // open switch arm
+
+        // Small pin-label letters near each pin endpoint (outward from body)
+        ImU32 lblCol = sel ? IM_COL32(255,230,100,220) : IM_COL32(160,200,255,200);
+        float lsz    = 12.0f;
+        auto addPinLabel = [&](float ox, float oy, const char* text) {
+            ImVec2 ps = sc(ox, oy);
+            float dx = ps.x - ctr.x, dy = ps.y - ctr.y;
+            float len = sqrtf(dx*dx + dy*dy);
+            if (len < 1.f) return;
+            // Offset label outward from body center
+            float nx = dx/len, ny = dy/len;
+            ImVec2 ts = ImGui::CalcTextSize(text);
+            dl->AddText(nullptr, lsz,
+                {ps.x + nx*4.f - ts.x*0.5f, ps.y + ny*4.f - ts.y*0.5f},
+                lblCol, text);
+        };
+        float lbxos = 20.f;
+        addPinLabel(-40+lbxos,-20+lsz, "G");
+        addPinLabel(-40+lbxos,+20-lsz, "GRef");
+        addPinLabel(+40-lbxos,-20+lsz, "D");
+        addPinLabel(+40-lbxos,+20-lsz, "S");
     }
     // ── Transformer 2-winding (turns ratio label) ─────────────────────────
     else if (id == "TX") {
