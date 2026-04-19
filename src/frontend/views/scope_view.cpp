@@ -313,10 +313,9 @@ void ScopeView::render(MainViewModel& vm) {
         return;
     }
 
-    // Reset per-frame structure-change guard.  Must happen before any
-    // insertPlot/removePlot calls (toolbar buttons, context menu) so that
-    // the flag correctly reflects whether the plot list changed this frame.
+    // Reset per-frame guards.
     plotStructureChanged_ = false;
+    vm.setHoveredSignal("");
 
     ScopeModel& scope = vm.scope();
 
@@ -507,15 +506,13 @@ void ScopeView::renderPlot(MainViewModel& vm, PlotArea& plot,
         };
 
         if (offset >= count) {
-            // Buffer not yet wrapped — one contiguous block [0, count)
             renderSeg(entry->signalName.c_str(), 0, count);
         } else {
-            // Wrapped ring buffer: older segment [offset, count), newer [0, offset)
-            // Both are monotonically increasing in X; rendered as separate PlotLine
-            // calls.  The gap between them is ≤ dt (imperceptible at normal zoom).
             renderSeg(entry->signalName.c_str(), offset, count - offset);
             renderSeg("##seg2", 0, offset);
         }
+        if (ImPlot::IsLegendEntryHovered(entry->signalName.c_str()))
+            vm.setHoveredSignal(entry->signalName);
     }
 
     // ── Auto-zoom drag (always active) ────────────────────────────────────────

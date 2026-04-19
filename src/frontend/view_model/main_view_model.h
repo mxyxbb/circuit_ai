@@ -46,6 +46,10 @@ public:
     const SchematicModel& schematic() const { return schematic_; }
     void buildFromSchematic();
 
+    // Cross-view signal highlight (scope legend hover → schematic highlight)
+    void setHoveredSignal(const std::string& s) { hoveredSignal_ = s; }
+    const std::string& hoveredSignal() const { return hoveredSignal_; }
+
 private:
     void dispatchSample(const SimSample& sample);
     void autoPopulateScope();
@@ -67,4 +71,5 @@ private:
     static constexpr size_t kMaxDiagLog = 200;
 
     SchematicModel schematic_;
+    std::string hoveredSignal_;
 };

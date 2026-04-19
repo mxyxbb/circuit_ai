@@ -58,9 +58,9 @@ static const std::vector<CompTypeDef> s_compTypes = {
       {24,14} },
 
     { "S",        "Switch",         "S",
-      { {"D",{+40,-20}}, {"S",{+40,+20}}, {"G",{-40,-20}}, {"GRef",{-40,+20}} },
+      { {"D",{0,-40}}, {"S",{0,+40}}, {"G",{-40,0}}, {"GRef",{-40,+20}} },
       {},
-      {24,24} },
+      {22,44} },
 
     { "TX",       "Transformer",    "TX",
       { {"P1",{-40,-20}}, {"N1",{-40,20}}, {"P2",{40,-20}}, {"N2",{40,20}} },
@@ -73,6 +73,31 @@ static const std::vector<CompTypeDef> s_compTypes = {
         {"P3",{+40,+10}}, {"N3",{+40,+30}} },
       { {"turns1","10"}, {"turns2","1"}, {"turns3","1"} },
       {28,36} },
+
+    { "JUNC",     "Junction",       "",
+      { {"J",{0,0}} },
+      {},
+      {4,4} },
+
+    { "NETLABEL", "Net Label",      "NET",
+      { {"NET",{-20,0}} },
+      { {"label","NET1"} },
+      {24,10} },
+
+    { "TX_WIND",  "TX Winding",     "",
+      { {"P",{0,-40}}, {"N",{0,+40}} },
+      { {"txGroup","TX1"}, {"windingIdx","1"}, {"turns (n)","1"} },
+      {20,44} },
+
+    { "TX_CORE",  "TX Core",        "",
+      {},
+      { {"txGroup","TX1"}, {"numWindings","2"} },
+      {4,40} },
+
+    { "TXN_CUSTOM","Custom TX...",  "",
+      {},
+      {},
+      {10,10} },
 
     { "GND",      "Ground",         "",
       { {"GND",{0,0}} },
@@ -182,6 +207,71 @@ void SchematicModel::clear() {
     prefixCounts_.clear();
 }
 
+// ── Node map (union-find without SPICE output) ────────────────────────────────
+
+std::unordered_map<int,int> SchematicModel::computePinNodeMap() const {
+    const int GND_KEY = -1;
+    std::unordered_map<int,int> ufp;
+    std::function<int(int)> ufFind = [&](int x) -> int {
+        if (!ufp.count(x)) ufp[x] = x;
+        if (ufp.at(x) != x) ufp[x] = ufFind(ufp.at(x));
+        return ufp.at(x);
+    };
+    auto ufUnite = [&](int a, int b) {
+        int ra = ufFind(a), rb = ufFind(b);
+        if (ra != rb) ufp[ra] = rb;
+    };
+    for (const auto& c : comps_) {
+        const CompTypeDef* td = findCompType(c.typeId);
+        if (!td) continue;
+        for (int i = 0; i < (int)td->pins.size(); ++i)
+            ufFind(pinKey(c.id, i));
+    }
+    for (const auto& c : comps_)
+        if (c.typeId == "GND") ufUnite(pinKey(c.id, 0), GND_KEY);
+    for (const auto& w : wires_)
+        ufUnite(pinKey(w.fromCompId, w.fromPinIdx), pinKey(w.toCompId, w.toPinIdx));
+    {
+        std::unordered_map<std::string,int> labelKey;
+        for (const auto& c : comps_) {
+            if (c.typeId != "NETLABEL" || c.paramValues.empty()) continue;
+            int key = pinKey(c.id, 0);
+            auto it = labelKey.find(c.paramValues[0]);
+            if (it == labelKey.end()) labelKey[c.paramValues[0]] = key;
+            else ufUnite(key, it->second);
+        }
+    }
+    {
+        std::unordered_map<std::string,int> netKey;
+        for (const auto& w : wires_) {
+            if (w.netName.empty()) continue;
+            int key = pinKey(w.fromCompId, w.fromPinIdx);
+            auto it = netKey.find(w.netName);
+            if (it == netKey.end()) netKey[w.netName] = key;
+            else ufUnite(key, it->second);
+        }
+    }
+    int gndRoot = ufFind(GND_KEY);
+    std::unordered_map<int,int> rootToNet;
+    rootToNet[gndRoot] = 0;
+    int nextNet = 1;
+    std::unordered_map<int,int> result;
+    for (const auto& c : comps_) {
+        const CompTypeDef* td = findCompType(c.typeId);
+        if (!td) continue;
+        for (int i = 0; i < (int)td->pins.size(); ++i) {
+            int key = pinKey(c.id, i);
+            int root = ufFind(key);
+            auto it = rootToNet.find(root);
+            int node;
+            if (it != rootToNet.end()) node = it->second;
+            else { node = nextNet++; rootToNet[root] = node; }
+            result[key] = node;
+        }
+    }
+    return result;
+}
+
 // ── Netlist generation ────────────────────────────────────────────────────────
 
 std::string SchematicModel::generateNetlist(const SchematicSimConfig& cfg) const {
@@ -220,6 +310,30 @@ std::string SchematicModel::generateNetlist(const SchematicSimConfig& cfg) const
     for (const auto& w : wires_)
         ufUnite(pinKey(w.fromCompId, w.fromPinIdx),
                 pinKey(w.toCompId,   w.toPinIdx));
+
+    // NETLABEL → unite pins with same label text (global net shorthand)
+    {
+        std::unordered_map<std::string,int> labelKey;
+        for (const auto& c : comps_) {
+            if (c.typeId != "NETLABEL" || c.paramValues.empty()) continue;
+            int key = pinKey(c.id, 0);
+            auto it = labelKey.find(c.paramValues[0]);
+            if (it == labelKey.end()) labelKey[c.paramValues[0]] = key;
+            else ufUnite(key, it->second);
+        }
+    }
+
+    // Wire netNames → unite wires sharing the same user-assigned name
+    {
+        std::unordered_map<std::string,int> netKey;
+        for (const auto& w : wires_) {
+            if (w.netName.empty()) continue;
+            int key = pinKey(w.fromCompId, w.fromPinIdx);
+            auto it = netKey.find(w.netName);
+            if (it == netKey.end()) netKey[w.netName] = key;
+            else ufUnite(key, it->second);
+        }
+    }
 
     // Assign net numbers: GND root → 0, rest → 1,2,3...
     int gndRoot = ufFind(GND_KEY);
@@ -301,6 +415,34 @@ std::string SchematicModel::generateNetlist(const SchematicSimConfig& cfg) const
                 << ' ' << nets[2] << ' ' << nets[3]
                 << ' ' << nets[4] << ' ' << nets[5]
                 << " turns1=" << p(0) << " turns2=" << p(1) << " turns3=" << p(2) << '\n';
+        } else if (comp.typeId == "TX_CORE") {
+            if (comp.paramValues.empty()) continue;
+            const std::string& grp = comp.paramValues[0];
+            // Collect TX_WIND components belonging to this group, sorted by windingIdx
+            std::vector<const SchematicComp*> winds;
+            for (const auto& wc : comps_) {
+                if (wc.typeId == "TX_WIND" && !wc.paramValues.empty() && wc.paramValues[0] == grp)
+                    winds.push_back(&wc);
+            }
+            if (winds.empty()) continue;
+            std::sort(winds.begin(), winds.end(), [](const SchematicComp* a, const SchematicComp* b){
+                int ai=0, bi=0;
+                try { if (a->paramValues.size()>1) ai=std::stoi(a->paramValues[1]); } catch(...){}
+                try { if (b->paramValues.size()>1) bi=std::stoi(b->paramValues[1]); } catch(...){}
+                return ai < bi;
+            });
+            oss << n;
+            for (const auto* wc : winds)
+                oss << ' ' << getNet(wc->id, 0) << ' ' << getNet(wc->id, 1);
+            for (int wi = 0; wi < (int)winds.size(); ++wi) {
+                const std::string& t = (winds[wi]->paramValues.size() > 2)
+                    ? winds[wi]->paramValues[2] : "1";
+                oss << " turns" << (wi+1) << '=' << t;
+            }
+            oss << '\n';
+        } else if (comp.typeId == "TX_WIND"   || comp.typeId == "JUNC" ||
+                   comp.typeId == "NETLABEL"   || comp.typeId == "TXN_CUSTOM") {
+            // No direct SPICE output for these helper types
         }
     }
 
@@ -308,9 +450,11 @@ std::string SchematicModel::generateNetlist(const SchematicSimConfig& cfg) const
     // Probe all node voltages
     for (int net : usedNets)
         oss << ".PROBE V(" << net << ")\n";
-    // Probe branch current of every non-GND component
+    // Probe branch current of every component that emits SPICE
     for (const auto& comp : comps_) {
-        if (comp.typeId == "GND") continue;
+        if (comp.typeId == "GND"      || comp.typeId == "TX_WIND" ||
+            comp.typeId == "JUNC"     || comp.typeId == "NETLABEL" ||
+            comp.typeId == "TXN_CUSTOM") continue;
         oss << ".PROBE I(" << comp.instanceName << ")\n";
     }
     oss << ".END\n";
@@ -330,7 +474,7 @@ bool SchematicModel::saveToFile(const std::string& path) const {
     std::ofstream f(path);
     if (!f) return false;
 
-    f << "CSCH2\n";
+    f << "CSCH3\n";
     f << "S " << simCfg.dt << ' ' << simCfg.tEnd << '\n';
 
     for (const auto& c : comps_) {
@@ -353,6 +497,8 @@ bool SchematicModel::saveToFile(const std::string& path) const {
           << ' ' << w.toCompId   << ' ' << w.toPinIdx;
         for (const auto& wp : w.waypoints)
             f << ' ' << wp.x << ' ' << wp.y;
+        if (!w.netName.empty())
+            f << " name=" << w.netName;
         f << '\n';
     }
 
@@ -366,8 +512,9 @@ bool SchematicModel::loadFromFile(const std::string& path) {
     std::string line;
     if (!std::getline(f, line)) return false;
     if (!line.empty() && line.back() == '\r') line.pop_back();
-    bool hasMirrorX = (line == "CSCH2");
-    if (line != "CSCH1" && line != "CSCH2") return false;
+    bool hasMirrorX = (line == "CSCH2" || line == "CSCH3");
+    bool hasNetName = (line == "CSCH3");
+    if (line != "CSCH1" && line != "CSCH2" && line != "CSCH3") return false;
 
     clear();
     int maxCompId = 0, maxWireId = 0;
@@ -416,9 +563,16 @@ bool SchematicModel::loadFromFile(const std::string& path) {
             if (!(ss >> w.id >> w.fromCompId >> w.fromPinIdx
                      >> w.toCompId >> w.toPinIdx))
                 continue;
-            float wx, wy;
-            while (ss >> wx >> wy)
-                w.waypoints.push_back({wx, wy});
+            std::string tok;
+            while (ss >> tok) {
+                if (hasNetName && tok.substr(0,5) == "name=") {
+                    w.netName = tok.substr(5);
+                } else {
+                    // two floats for waypoint
+                    float wx = std::stof(tok), wy;
+                    if (ss >> wy) w.waypoints.push_back({wx, wy});
+                }
+            }
             if (w.id > maxWireId) maxWireId = w.id;
             wires_.push_back(std::move(w));
         }

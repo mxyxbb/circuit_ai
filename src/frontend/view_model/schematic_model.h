@@ -43,6 +43,7 @@ struct SchematicWire {
     int fromCompId = -1, fromPinIdx = -1;
     int toCompId   = -1, toPinIdx   = -1;
     std::vector<ImVec2> waypoints;  // intermediate canvas-space points (routed path)
+    std::string netName;            // user-assigned net label (empty = auto-numbered)
 };
 
 // ── Simulation parameters stored with the schematic ──────────────────────────
@@ -75,9 +76,17 @@ public:
     void removeWire(int id);
     std::vector<SchematicWire>&       wires()       { return wires_; }
     const std::vector<SchematicWire>& wires() const { return wires_; }
+    SchematicWire* findWire(int id) {
+        for (auto& w : wires_) if (w.id == id) return &w;
+        return nullptr;
+    }
 
     // SPICE netlist generation — returns "" if schematic is empty
     std::string generateNetlist(const SchematicSimConfig& cfg) const;
+
+    // Returns pinKey(compId,pinIdx) → SPICE net number (same logic as generateNetlist)
+    std::unordered_map<int,int> computePinNodeMap() const;
+    static int pinKey(int compId, int pinIdx) { return compId * 64 + pinIdx; }
 
     // Persist / restore schematic (custom .sch text format)
     bool saveToFile(const std::string& path) const;

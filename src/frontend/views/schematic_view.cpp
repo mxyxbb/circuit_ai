@@ -173,10 +173,29 @@ void SchematicView::render(MainViewModel& vm) {
     ImGui::SameLine();
     ImGui::TextDisabled("|");
     ImGui::SameLine();
+    // Probe buttons
+    {
+        bool vActive = (probeMode_ == PM_VProbe);
+        bool iActive = (probeMode_ == PM_IProbe);
+        if (vActive) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f,0.6f,0.2f,1.0f));
+        if (ImGui::SmallButton("V-Probe")) probeMode_ = vActive ? PM_None : PM_VProbe;
+        if (vActive) ImGui::PopStyleColor();
+        ImGui::SameLine();
+        if (iActive) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f,0.6f,0.2f,1.0f));
+        if (ImGui::SmallButton("I-Probe")) probeMode_ = iActive ? PM_None : PM_IProbe;
+        if (iActive) ImGui::PopStyleColor();
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("|");
+    ImGui::SameLine();
     if (wiringActive_) {
         ImGui::TextColored({0.3f,1.0f,0.5f,1.0f}, "[WIRING — click pin to finish / click canvas for waypoint / Esc cancel]");
+    } else if (probeMode_ == PM_VProbe) {
+        ImGui::TextColored({0.3f,1.0f,0.3f,1.0f}, "[V-PROBE — click a wire to add voltage to selected Scope plot]");
+    } else if (probeMode_ == PM_IProbe) {
+        ImGui::TextColored({0.3f,1.0f,0.3f,1.0f}, "[I-PROBE — click a pin to add its current to selected Scope plot]");
     } else {
-        ImGui::TextDisabled("LClick=sel/wire  R=rotate  X=mirror  Ctrl+C=copy  RDrag=pan  Scroll=zoom  Del=delete  LDrag(empty)=multisel  Ctrl+LClick=add sel");
+        ImGui::TextDisabled("LClick=sel/wire  R=rotate  X=mirror  Ctrl+C=copy  RDrag=pan  Scroll=zoom  Del=delete  LDrag(empty)=multisel  Ctrl+LClick=add sel  DblClick wire=net name");
     }
     ImGui::Separator();
 
@@ -207,7 +226,16 @@ void SchematicView::render(MainViewModel& vm) {
         if (const ImGuiPayload* pl = ImGui::AcceptDragDropPayload("COMP_TYPE")) {
             std::string typeId(static_cast<const char*>(pl->Data));
             ImVec2 dropCanvas = snapGrid(s2c(ImGui::GetMousePos(), origin));
-            sch.addComp(typeId, dropCanvas);
+            if (typeId == "TXN_CUSTOM") {
+                txNPending_    = true;
+                txNPendingPos_ = dropCanvas;
+                txNWindings_   = 2;
+                snprintf(txNGroupBuf_, sizeof(txNGroupBuf_), "TX%d",
+                         (int)sch.comps().size() + 1);
+                for (int i = 0; i < 6; ++i) snprintf(txNTurns_[i], 16, "%d", i==0?10:1);
+            } else {
+                sch.addComp(typeId, dropCanvas);
+            }
         }
         ImGui::EndDragDropTarget();
     }
@@ -223,6 +251,65 @@ void SchematicView::render(MainViewModel& vm) {
     ImGui::EndChild();
 
     renderProperties(vm);
+
+    // ── Wire net name edit popup ─────────────────────────────────────────
+    if (editNetWireId_ >= 0) ImGui::OpenPopup("Net Name##wireDlg");
+    if (ImGui::BeginPopupModal("Net Name##wireDlg", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("Net name (empty = auto-number):");
+        ImGui::SetNextItemWidth(200.f);
+        bool commit = ImGui::InputText("##netname", editNetNameBuf_, sizeof(editNetNameBuf_),
+                                       ImGuiInputTextFlags_EnterReturnsTrue);
+        if (commit || ImGui::Button("OK")) {
+            SchematicWire* ew = vm.schematic().findWire(editNetWireId_);
+            if (ew) ew->netName = editNetNameBuf_;
+            editNetWireId_ = -1;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) { editNetWireId_ = -1; ImGui::CloseCurrentPopup(); }
+        ImGui::EndPopup();
+    }
+
+    // ── Custom TX wizard dialog ───────────────────────────────────────────
+    if (txNPending_) ImGui::OpenPopup("Custom TX##dlg");
+    if (ImGui::BeginPopupModal("Custom TX##dlg", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::InputText("Group name", txNGroupBuf_, sizeof(txNGroupBuf_));
+        ImGui::SliderInt("Windings", &txNWindings_, 2, 6);
+        for (int i = 0; i < txNWindings_; ++i) {
+            char label[32]; snprintf(label, sizeof(label), "Turns[%d]", i+1);
+            ImGui::InputText(label, txNTurns_[i], sizeof(txNTurns_[i]));
+        }
+        if (ImGui::Button("Create")) {
+            SchematicModel& sch = vm.schematic();
+            // TX_CORE at drop position
+            int coreId = sch.addComp("TX_CORE", txNPendingPos_);
+            SchematicComp* core = sch.findComp(coreId);
+            if (core) {
+                core->paramValues[0] = txNGroupBuf_;
+                char nbuf[8]; snprintf(nbuf, sizeof(nbuf), "%d", txNWindings_);
+                core->paramValues[1] = nbuf;
+            }
+            // TX_WIND components: primary at drop pos, secondaries offset right
+            for (int i = 0; i < txNWindings_; ++i) {
+                ImVec2 wpos = {txNPendingPos_.x + i * 80.f, txNPendingPos_.y};
+                int wid = sch.addComp("TX_WIND", wpos);
+                SchematicComp* w = sch.findComp(wid);
+                if (w) {
+                    w->paramValues[0] = txNGroupBuf_;
+                    char ibuf[8]; snprintf(ibuf, sizeof(ibuf), "%d", i+1);
+                    w->paramValues[1] = ibuf;
+                    w->paramValues[2] = std::string(txNTurns_[i]);
+                    if (i > 0) w->mirrorX = true;  // secondary windings face inward
+                }
+            }
+            txNPending_ = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) { txNPending_ = false; ImGui::CloseCurrentPopup(); }
+        ImGui::EndPopup();
+    }
+
     ImGui::End();
 }
 
@@ -272,13 +359,19 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
             for (int cid : toCopy) {
                 SchematicComp* src = sch.findComp(cid);
                 if (!src) continue;
-                ImVec2 newPos = snapGrid({src->pos.x + 40.f, src->pos.y + 40.f});
-                int newId = sch.addComp(src->typeId, newPos);
+                // Save before addComp — vector reallocation invalidates src pointer
+                std::string srcTypeId   = src->typeId;
+                ImVec2      srcPos      = src->pos;
+                int         srcRot      = src->rotation;
+                bool        srcMirrorX  = src->mirrorX;
+                auto        srcParams   = src->paramValues;
+                ImVec2 newPos = snapGrid({srcPos.x + 40.f, srcPos.y + 40.f});
+                int newId = sch.addComp(srcTypeId, newPos);
                 SchematicComp* dst = sch.findComp(newId);
                 if (dst) {
-                    dst->rotation    = src->rotation;
-                    dst->mirrorX     = src->mirrorX;
-                    dst->paramValues = src->paramValues;
+                    dst->rotation    = srcRot;
+                    dst->mirrorX     = srcMirrorX;
+                    dst->paramValues = srcParams;
                 }
                 idMap[cid] = newId;
                 newIds.push_back(newId);
@@ -326,8 +419,76 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
         }
     }
 
+    // ── Probe mode left-click ─────────────────────────────────────────────
+    if (hovered && probeMode_ != PM_None && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        ScopeModel& scope = vm.scope();
+        int selPlot = scope.selectedPlot();
+        if (probeMode_ == PM_VProbe) {
+            // Find nearest wire or node, determine its net number
+            float wireHitR = 10.0f / zoom_;
+            int nearWireFrom = -1, nearWireFromPin = -1;
+            float bestD = wireHitR;
+            for (const auto& wire : sch.wires()) {
+                const SchematicComp* ca = sch.findComp(wire.fromCompId);
+                const SchematicComp* cb = sch.findComp(wire.toCompId);
+                if (!ca || !cb) continue;
+                std::vector<ImVec2> path;
+                path.push_back(pinCanvasPos(*ca, wire.fromPinIdx));
+                for (const auto& wp : wire.waypoints) path.push_back(wp);
+                path.push_back(pinCanvasPos(*cb, wire.toPinIdx));
+                for (size_t i=1;i<path.size();++i) {
+                    float d = distPointToSegment(mousePt, path[i-1], path[i]);
+                    if (d < bestD) {
+                        bestD = d;
+                        nearWireFrom    = wire.fromCompId;
+                        nearWireFromPin = wire.fromPinIdx;
+                    }
+                }
+            }
+            if (nearWireFrom >= 0) {
+                auto nodeMap = sch.computePinNodeMap();
+                auto it = nodeMap.find(SchematicModel::pinKey(nearWireFrom, nearWireFromPin));
+                if (it != nodeMap.end() && it->second != 0) {
+                    char sigName[32];
+                    std::snprintf(sigName, sizeof(sigName), "V(%d)", it->second);
+                    // Check signal exists
+                    for (const auto& si : vm.availableSignals()) {
+                        if (si.name == sigName) {
+                            scope.addSignalToPlot(selPlot, si.name, 0);
+                            break;
+                        }
+                    }
+                }
+            }
+        } else if (probeMode_ == PM_IProbe) {
+            // Find nearest pin
+            float hitR2 = (12.0f / zoom_) * (12.0f / zoom_);
+            for (const auto& comp : sch.comps()) {
+                const CompTypeDef* td = SchematicModel::findCompType(comp.typeId);
+                if (!td) continue;
+                for (int pi=0; pi<(int)td->pins.size(); ++pi) {
+                    ImVec2 pPos = pinCanvasPos(comp, pi);
+                    float dx=mousePt.x-pPos.x, dy=mousePt.y-pPos.y;
+                    if (dx*dx+dy*dy <= hitR2) {
+                        char sigName[64];
+                        std::snprintf(sigName, sizeof(sigName), "I(%s)", comp.instanceName.c_str());
+                        for (const auto& si : vm.availableSignals()) {
+                            if (si.name == sigName) {
+                                scope.addSignalToPlot(selPlot, si.name, 0);
+                                break;
+                            }
+                        }
+                        goto probeHandled;
+                    }
+                }
+            }
+            probeHandled:;
+        }
+        probeMode_ = PM_None;
+    }
+
     // ── Left-click ────────────────────────────────────────────────────────
-    if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+    if (hovered && probeMode_ == PM_None && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         bool hitPin = false, hitBody = false;
 
         // Priority 1: pins (use rotated positions)
@@ -355,9 +516,52 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
             if (hitPin) break;
         }
 
-        // During wiring: canvas click adds a waypoint
+        // During wiring: check wire-to-wire hit, otherwise add waypoint
         if (!hitPin && wiringActive_) {
-            wireWaypoints_.push_back(snapGrid(mousePt));
+            float wireHitR2 = (8.0f / zoom_) * (8.0f / zoom_);
+            int hitWireId = -1;
+            ImVec2 hitWireSnap = snapGrid(mousePt);
+            for (auto& w : sch.wires()) {
+                // Build full path including waypoints
+                SchematicComp* fc = sch.findComp(w.fromCompId);
+                SchematicComp* tc = sch.findComp(w.toCompId);
+                if (!fc || !tc) continue;
+                const CompTypeDef* ftd = SchematicModel::findCompType(fc->typeId);
+                const CompTypeDef* ttd = SchematicModel::findCompType(tc->typeId);
+                if (!ftd || !ttd) continue;
+                ImVec2 fPos = pinCanvasPos(*fc, w.fromPinIdx);
+                ImVec2 tPos = pinCanvasPos(*tc, w.toPinIdx);
+                std::vector<ImVec2> path;
+                path.push_back(fPos);
+                for (auto& wp : w.waypoints) path.push_back(wp);
+                path.push_back(tPos);
+                for (int si = 0; si + 1 < (int)path.size(); ++si) {
+                    float d = distPointToSegment(mousePt, path[si], path[si+1]);
+                    if (d*d <= wireHitR2) {
+                        hitWireId = w.id;
+                        // Snap junction to nearest point on segment
+                        ImVec2 a = path[si], b = path[si+1];
+                        ImVec2 ab = {b.x-a.x, b.y-a.y};
+                        float len2 = ab.x*ab.x + ab.y*ab.y;
+                        if (len2 > 0.f) {
+                            float t = ((mousePt.x-a.x)*ab.x + (mousePt.y-a.y)*ab.y) / len2;
+                            t = t < 0.f ? 0.f : (t > 1.f ? 1.f : t);
+                            hitWireSnap = snapGrid({a.x + t*ab.x, a.y + t*ab.y});
+                        }
+                        break;
+                    }
+                }
+                if (hitWireId >= 0) break;
+            }
+            if (hitWireId >= 0) {
+                int juncId = insertJunctionOnWire(sch, hitWireId, hitWireSnap);
+                if (juncId >= 0) {
+                    sch.addWire(wireFromCompId_, wireFromPinIdx_, juncId, 0, wireWaypoints_);
+                    wiringActive_ = false; wireFromCompId_ = -1; wireWaypoints_.clear();
+                }
+            } else {
+                wireWaypoints_.push_back(snapGrid(mousePt));
+            }
         }
 
         // Priority 2: component bodies (only when not wiring)
@@ -448,6 +652,14 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
                 selectedCompId_   = -1;
                 multiSelectedIds_.clear();
                 propEditCompId_   = -1;
+                // Double-click on wire → open net name editor
+                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                    editNetWireId_ = bestWireId;
+                    SchematicWire* ew = sch.findWire(bestWireId);
+                    strncpy(editNetNameBuf_, ew ? ew->netName.c_str() : "",
+                            sizeof(editNetNameBuf_)-1);
+                    editNetNameBuf_[sizeof(editNetNameBuf_)-1] = '\0';
+                }
             } else {
                 // Start rubber-band selection box
                 selBoxActive_       = true;
@@ -550,13 +762,32 @@ void SchematicView::drawGrid(ImDrawList* dl, ImVec2 origin, ImVec2 size) const {
 void SchematicView::drawWires(ImDrawList* dl, MainViewModel& vm, ImVec2 origin) const {
     const SchematicModel& sch = vm.schematic();
     const ImU32 wireCol = IM_COL32(200, 200, 80, 220);
+
+    // Determine which net to highlight (from scope legend hover)
+    const std::string& hovSig = vm.hoveredSignal();
+    int hovNet = -1;
+    std::unordered_map<int,int> nodeMap;
+    if (hovSig.size() > 2 && hovSig[0]=='V' && hovSig[1]=='(') {
+        try { hovNet = std::stoi(hovSig.substr(2, hovSig.size()-3)); } catch(...) {}
+        if (hovNet >= 0) nodeMap = sch.computePinNodeMap();
+    }
+
     for (const auto& wire : sch.wires()) {
         const SchematicComp* ca = sch.findComp(wire.fromCompId);
         const SchematicComp* cb = sch.findComp(wire.toCompId);
         if (!ca || !cb) continue;
         bool wireSel = (wire.id == selectedWireId_);
-        ImU32 col = wireSel ? IM_COL32(255, 255, 100, 255) : wireCol;
-        float thick = wireSel ? 3.0f * zoom_ : 1.5f * zoom_;
+
+        // Highlight if wire is in the hovered net
+        bool wireHighlight = false;
+        if (hovNet >= 0 && !nodeMap.empty()) {
+            auto it = nodeMap.find(SchematicModel::pinKey(wire.fromCompId, wire.fromPinIdx));
+            wireHighlight = (it != nodeMap.end() && it->second == hovNet);
+        }
+
+        ImU32 col = wireSel        ? IM_COL32(255, 255, 100, 255) :
+                    wireHighlight  ? IM_COL32(255, 160,  50, 255) : wireCol;
+        float thick = (wireSel || wireHighlight) ? 3.0f * zoom_ : 1.5f * zoom_;
 
         ImVec2 prevScr = c2s(pinCanvasPos(*ca, wire.fromPinIdx), origin);
         for (const auto& wp : wire.waypoints) {
@@ -566,7 +797,96 @@ void SchematicView::drawWires(ImDrawList* dl, MainViewModel& vm, ImVec2 origin) 
         }
         ImVec2 toScr = c2s(pinCanvasPos(*cb, wire.toPinIdx), origin);
         dl->AddLine(prevScr, toScr, col, thick);
+
+        // Net name label at wire midpoint (between last waypoint and toScr)
+        if (!wire.netName.empty()) {
+            ImVec2 mid = {(prevScr.x + toScr.x) * 0.5f, (prevScr.y + toScr.y) * 0.5f - 8.f * zoom_};
+            ImVec2 ts  = ImGui::CalcTextSize(wire.netName.c_str());
+            dl->AddText({mid.x - ts.x * 0.5f, mid.y - ts.y * 0.5f},
+                        IM_COL32(120, 220, 255, 220), wire.netName.c_str());
+        }
     }
+}
+
+// ── Dashed line helper ─────────────────────────────────────────────────────
+
+void SchematicView::drawDashedLine(ImDrawList* dl, ImVec2 a, ImVec2 b,
+                                   ImU32 col, float thick, float dashLen, float gapLen) {
+    float dx=b.x-a.x, dy=b.y-a.y, len=sqrtf(dx*dx+dy*dy);
+    if (len<1.f) return;
+    float nx=dx/len, ny=dy/len, t=0.f; bool draw=true;
+    while (t<len) {
+        float seg=draw?dashLen:gapLen, tEnd=std::min(t+seg,len);
+        if (draw) dl->AddLine({a.x+nx*t,a.y+ny*t},{a.x+nx*tEnd,a.y+ny*tEnd},col,thick);
+        t=tEnd; draw=!draw;
+    }
+}
+
+// ── Insert JUNC on existing wire ───────────────────────────────────────────
+
+int SchematicView::insertJunctionOnWire(SchematicModel& sch, int wireId, ImVec2 juncPos) {
+    SchematicWire wc; bool found=false;
+    for (const auto& w:sch.wires()) { if (w.id==wireId){wc=w;found=true;break;} }
+    if (!found) return -1;
+    const SchematicComp* ca=sch.findComp(wc.fromCompId);
+    const SchematicComp* cb=sch.findComp(wc.toCompId);
+    if (!ca||!cb) return -1;
+    std::vector<ImVec2> fp;
+    fp.push_back(pinCanvasPos(*ca,wc.fromPinIdx));
+    for (const auto& wp:wc.waypoints) fp.push_back(wp);
+    fp.push_back(pinCanvasPos(*cb,wc.toPinIdx));
+    int splitSeg=-1; float bestD=10.f;
+    for (int i=1;i<(int)fp.size();++i){
+        float d=distPointToSegment(juncPos,fp[i-1],fp[i]);
+        if (d<bestD){bestD=d;splitSeg=i;}
+    }
+    if (splitSeg<0) return -1;
+    int juncId=sch.addComp("JUNC",juncPos);
+    std::vector<ImVec2> wp1,wp2;
+    for (int i=1;i<splitSeg;++i)                wp1.push_back(fp[i]);
+    for (int i=splitSeg;i<(int)fp.size()-1;++i) wp2.push_back(fp[i]);
+    sch.removeWire(wireId);
+    sch.addWire(wc.fromCompId,wc.fromPinIdx,juncId,0,wp1);
+    sch.addWire(juncId,0,wc.toCompId,wc.toPinIdx,wp2);
+    return juncId;
+}
+
+// ── TX_CORE coupling dashes ────────────────────────────────────────────────
+
+void SchematicView::drawTxCoreSymbol(ImDrawList* dl, const SchematicComp& txCore,
+                                     const SchematicModel& sch, ImVec2 origin) const {
+    if (txCore.paramValues.empty()) return;
+    const std::string& grp=txCore.paramValues[0];
+    std::vector<const SchematicComp*> winds;
+    for (const auto& c:sch.comps())
+        if (c.typeId=="TX_WIND"&&!c.paramValues.empty()&&c.paramValues[0]==grp)
+            winds.push_back(&c);
+    if (winds.size()<2) return;
+    std::sort(winds.begin(),winds.end(),[](const SchematicComp*a,const SchematicComp*b){
+        int ai=0,bi=0;
+        try{if(a->paramValues.size()>1)ai=std::stoi(a->paramValues[1]);}catch(...){}
+        try{if(b->paramValues.size()>1)bi=std::stoi(b->paramValues[1]);}catch(...){}
+        return ai<bi;
+    });
+    ImU32 dc=IM_COL32(120,155,220,110); float z=zoom_;
+    // Helper: apply mirrorX + rotation to a local offset and convert to screen coords
+    auto windSC = [&](const SchematicComp& wc, float ox, float oy) -> ImVec2 {
+        float mx = wc.mirrorX ? -ox : ox;
+        ImVec2 r = rotateOff({mx, oy}, wc.rotation);
+        ImVec2 ctr_w = c2s(wc.pos, origin);
+        return {ctr_w.x + r.x * z, ctr_w.y + r.y * z};
+    };
+    std::vector<ImVec2> mids;
+    for (const auto* wc:winds){
+        // Dashed bar on the "flat" side (-x before mirrorX), ±24 along winding axis
+        ImVec2 top = windSC(*wc, -14.f, -24.f);
+        ImVec2 bot = windSC(*wc, -14.f, +24.f);
+        ImVec2 mid = windSC(*wc, -14.f,   0.f);
+        drawDashedLine(dl, top, bot, dc, 1.3f*z, 5.f*z, 3.f*z);
+        mids.push_back(mid);
+    }
+    for (size_t i=1;i<mids.size();++i)
+        drawDashedLine(dl,mids[i-1],mids[i],dc,1.0f*z,4.f*z,3.f*z);
 }
 
 // ── Per-type standard symbol drawing ──────────────────────────────────────
@@ -675,40 +995,69 @@ void SchematicView::drawCompSymbol(ImDrawList* dl, const SchematicComp& comp,
         dl->PathStroke(col, ImDrawFlags_Closed, thick);
         dl->AddLine(sc(+12,-12), sc(+12,+12), col, thick);
     }
-    // ── Switch: G/GRef on left, D/S vertically on right ───────────────────
+    // ── N-channel MOSFET with body diode ────────────────────────────────────
+    // User coords (x,y) Y-up → canvas sc(x, -y). G(-20,0)→extends to sc(-40,0).
     else if (id == "S") {
-        // Gate terminal (left) — G at pin(-40,-20), GRef at pin(-40,+20)
-        dl->AddLine(sc(-40,-20), sc( -5,-20), col, thick);   // G lead
-        dl->AddLine(sc(-40,+20), sc( -5,+20), col, thick);   // GRef lead
-        dl->AddLine(sc( -5,-24), sc( -5,+24), col, thick);   // gate bar
-        dl->AddLine(sc( -5,  0), sc( +5,  0), col, thick);   // control line
-        // D-S contacts (right) — D at pin(+40,-20), S at pin(+40,+20)
-        dl->AddLine(sc(+40,-20), sc(+16,-20), col, thick);   // D lead
-        dl->AddLine(sc(+40,+20), sc(+16,+20), col, thick);   // S lead
-        dl->AddCircleFilled(sc(+16,-20), 3.f*z, col);         // D contact dot
-        dl->AddCircleFilled(sc(+16,+20), 3.f*z, col);         // S contact dot
-        dl->AddLine(sc(+16,-20), sc(+8,+8), col, thick);      // open switch arm
+        // G lead: model G pin → gate bar
+        dl->AddLine(sc(-40,  0), sc(0,  0), col, thick);
+        // GRef lead: model GRef pin → gate bar bottom
+        dl->AddLine(sc(-40, +20), sc(0, +20), col, thick);
+        // Gate bar: (0,15)→(0,-20) user = sc(0,-15)→sc(0,+20)
+        dl->AddLine(sc(0, -15), sc(0, +20), col, thick);
 
-        // Small pin-label letters near each pin endpoint (outward from body)
+        // Channel: 3 segments at x=5
+        dl->AddLine(sc(5, -20), sc(5, -10), col, thick);  // (5,20)→(5,10)
+        dl->AddLine(sc(5,  -5), sc(5,  +5), col, thick);  // (5,5)→(5,-5)
+        dl->AddLine(sc(5, +10), sc(5, +20), col, thick);  // (5,-10)→(5,-20)
+
+        // Horizontal stubs: drain y=-15, body y=0, source y=+15
+        dl->AddLine(sc(5, -15), sc(15, -15), col, thick);
+        dl->AddLine(sc(5,   0), sc(15,   0), col, thick);
+        dl->AddLine(sc(5, +15), sc(15, +15), col, thick);
+
+        // D vertical (15,15)→(15,25): drain stub → up  = sc(15,-15)→sc(15,-25)
+        dl->AddLine(sc(15, -15), sc(15, -25), col, thick);
+        // S vertical (15,0)→(15,-25): body stub → down = sc(15,0)→sc(15,+25)
+        dl->AddLine(sc(15,   0), sc(15, +25), col, thick);
+
+        // D horizontal (15,20)→(23,20) = sc(15,-20)→sc(23,-20)
+        dl->AddLine(sc(15, -20), sc(23, -20), col, thick);
+        // S horizontal (15,-20)→(23,-20) = sc(15,+20)→sc(23,+20)
+        dl->AddLine(sc(15, +20), sc(23, +20), col, thick);
+
+        // Outer bar (23,20)→(23,-20): split for body diode gap at y=-5..+10
+        dl->AddLine(sc(23, -20), sc(23,  -5), col, thick);  // upper
+        dl->AddLine(sc(23, +10), sc(23, +20), col, thick);  // lower
+
+        // D pin lead: sc(0,-40)→sc(0,-25)→sc(15,-25)  [L to D vertical top]
+        dl->AddLine(sc(0, -40), sc(0,  -25), col, thick);
+        dl->AddLine(sc(0, -25), sc(15, -25), col, thick);
+
+        // S pin lead: sc(15,+25)→sc(15,+40)→sc(0,+40)  [L from S vertical bottom]
+        dl->AddLine(sc(15, +25), sc(15, +40), col, thick);
+        dl->AddLine(sc(15, +40), sc(0,  +40), col, thick);
+
+        // Body arrow: left-pointing, tip at sc(0,0), base at sc(5,±5)
+        dl->AddTriangleFilled(sc(5, 0), sc(10, -5), sc(10, +5), col);
+
+        // Body diode: up-pointing, cathode tip at sc(23,-5)
+        // Cathode bar (23-5,5)→(23+5,5) = sc(18,-5)→sc(28,-5)
+        dl->AddLine(sc(18, -5), sc(28, -5), col, thick);
+        // Diode triangle: tip sc(23,-5), anode base sc(18,+10)→sc(28,+10)
+        dl->AddTriangleFilled(sc(23, -5), sc(18, +10), sc(28, +10), col);
+
+        // Pin labels
         ImU32 lblCol = sel ? IM_COL32(255,230,100,220) : IM_COL32(160,200,255,200);
         float lsz    = 12.0f;
-        auto addPinLabel = [&](float ox, float oy, const char* text) {
+        auto addPL = [&](float ox, float oy, float dx, float dy, const char* txt) {
             ImVec2 ps = sc(ox, oy);
-            float dx = ps.x - ctr.x, dy = ps.y - ctr.y;
-            float len = sqrtf(dx*dx + dy*dy);
-            if (len < 1.f) return;
-            // Offset label outward from body center
-            float nx = dx/len, ny = dy/len;
-            ImVec2 ts = ImGui::CalcTextSize(text);
-            dl->AddText(nullptr, lsz,
-                {ps.x + nx*4.f - ts.x*0.5f, ps.y + ny*4.f - ts.y*0.5f},
-                lblCol, text);
+            ImVec2 ts = ImGui::CalcTextSize(txt);
+            dl->AddText(nullptr, lsz, ImVec2{ps.x + dx*z - ts.x*.5f, ps.y + dy*z - ts.y*.5f}, lblCol, txt);
         };
-        float lbxos = 20.f;
-        addPinLabel(-40+lbxos,-20+lsz, "G");
-        addPinLabel(-40+lbxos,+20-lsz, "GRef");
-        addPinLabel(+40-lbxos,-20+lsz, "D");
-        addPinLabel(+40-lbxos,+20-lsz, "S");
+        addPL(-40,   0, -1.8f,  0.0f, "G");
+        addPL(-40, +20, -1.8f,  0.0f, "Ref");
+        addPL(  0, -40,  0.0f, -1.8f, "D");
+        addPL(  0, +40,  0.0f, +1.8f, "S");
     }
     // ── Transformer 2-winding (turns ratio label) ─────────────────────────
     else if (id == "TX") {
@@ -737,6 +1086,11 @@ void SchematicView::drawCompSymbol(ImDrawList* dl, const SchematicComp& comp,
             }
         }
         dl->PathStroke(col, 0, thick);
+        // Polarity dots at same-name ends (P1 / P2)
+        { ImU32 dc=sel?IM_COL32(255,230,100,255):IM_COL32(220,230,255,240);
+          dl->AddCircleFilled(sc(-28,-22),3.5f*z,dc);  // P1 dot
+          dl->AddCircleFilled(sc(+28,-22),3.5f*z,dc);  // P2 dot
+        }
         // Turns ratio "n1:n2" centred upright
         if (comp.paramValues.size() >= 2) {
             char turns[40];
@@ -800,6 +1154,57 @@ void SchematicView::drawCompSymbol(ImDrawList* dl, const SchematicComp& comp,
             dl->AddText({ctr.x - ts.x*0.5f, ctr.y - ts.y*0.5f},
                         sel ? IM_COL32(255,210,50,255) : IM_COL32(180,210,255,255), turns);
         }
+        // Polarity dots P1/P2/P3
+        { ImU32 dc=sel?IM_COL32(255,230,100,255):IM_COL32(220,230,255,240);
+          dl->AddCircleFilled(sc(-28,-22),3.5f*z,dc);
+          dl->AddCircleFilled(sc(+28,-32),3.5f*z,dc);
+          dl->AddCircleFilled(sc(+28, +8),3.5f*z,dc); }
+    }
+    // ── Junction dot ──────────────────────────────────────────────────────
+    else if (id == "JUNC") {
+        dl->AddCircleFilled(ctr, 5.f*z,
+            sel ? IM_COL32(255,210,50,255) : IM_COL32(80,210,120,255));
+    }
+    // ── Net label ─────────────────────────────────────────────────────────
+    else if (id == "NETLABEL") {
+        ImU32 nc = sel ? IM_COL32(255,210,50,255) : IM_COL32(80,230,120,255);
+        dl->AddLine(sc(-20,0), sc(0,0), nc, thick);  // lead
+        // Flag pentagon
+        dl->PathLineTo(sc(0,-7)); dl->PathLineTo(sc(+12,-7));
+        dl->PathLineTo(sc(+16,0)); dl->PathLineTo(sc(+12,+7));
+        dl->PathLineTo(sc(0,+7));
+        dl->PathStroke(nc, ImDrawFlags_Closed, thick*0.7f);
+        // Label text
+        if (!comp.paramValues.empty()) {
+            ImVec2 lc = sc(+8,0);
+            ImVec2 ts = ImGui::CalcTextSize(comp.paramValues[0].c_str());
+            dl->AddText({lc.x-ts.x*.5f, lc.y-ts.y*.5f}, nc, comp.paramValues[0].c_str());
+        }
+    }
+    // ── TX_WIND (individual transformer winding) ──────────────────────────
+    else if (id == "TX_WIND") {
+        dl->AddLine(sc(0,-40), sc(0,-24), col, thick);  // top lead
+        dl->AddLine(sc(0,+24), sc(0,+40), col, thick);  // bottom lead
+        // 4 rightward bumps
+        float bCy[4]={-18.f,-6.f,+6.f,+18.f};
+        for (int b=0;b<4;++b){
+            float yc=bCy[b];
+            for (int k=0;k<=12;++k){
+                float a=-PI/2.f+(float)k/12.f*PI;
+                dl->PathLineTo(sc(6.f*cosf(a), yc+6.f*sinf(a)));
+            }
+        }
+        dl->PathStroke(col, 0, thick);
+        // Polarity dot at P-side, on the flat/core side (-x before mirrorX)
+        { ImU32 dc=sel?IM_COL32(255,230,100,255):IM_COL32(220,230,255,240);
+          dl->AddCircleFilled(sc(-10,-22),2.5f*z,dc); }
+        // Turns label to the right
+        if (comp.paramValues.size() >= 3) {
+            char lbl[24]; std::snprintf(lbl,sizeof(lbl),"n=%s",comp.paramValues[2].c_str());
+            ImVec2 lp=sc(+18,0); ImVec2 ts=ImGui::CalcTextSize(lbl);
+            dl->AddText({lp.x-ts.x*.5f,lp.y-ts.y*.5f},
+                sel?IM_COL32(255,210,50,200):IM_COL32(180,210,255,200),lbl);
+        }
     }
 }
 
@@ -815,6 +1220,12 @@ void SchematicView::drawComponents(ImDrawList* dl, MainViewModel& vm, ImVec2 ori
                    (!multiSelectedIds_.empty() &&
                     std::find(multiSelectedIds_.begin(), multiSelectedIds_.end(), comp.id)
                         != multiSelectedIds_.end());
+        // Highlight component if scope legend hovers its current signal
+        const std::string& hovSig = vm.hoveredSignal();
+        if (!hovSig.empty() && hovSig.size()>2 && hovSig[0]=='I' && hovSig[1]=='(') {
+            std::string hovComp = hovSig.substr(2, hovSig.size()-3);
+            if (comp.instanceName == hovComp) sel = true;
+        }
         ImVec2 ctr = c2s(comp.pos, origin);
 
         // ── GND symbol ────────────────────────────────────────────────────
@@ -840,6 +1251,12 @@ void SchematicView::drawComponents(ImDrawList* dl, MainViewModel& vm, ImVec2 ori
             continue;
         }
 
+        // ── TX_CORE: custom coupling symbol, no standard label/pins ─────────
+        if (comp.typeId == "TX_CORE") {
+            drawTxCoreSymbol(dl, comp, vm.schematic(), origin);
+            continue;
+        }
+
         // ── Standard circuit symbol ───────────────────────────────────────
         drawCompSymbol(dl, comp, *td, ctr, sel);
 
@@ -849,16 +1266,26 @@ void SchematicView::drawComponents(ImDrawList* dl, MainViewModel& vm, ImVec2 ori
         float bxs = bx * zoom_, bys = by * zoom_;
         (void)bxs;
 
-        // Instance name (+ first param) below/beside body
-        char lbl[80];
-        if (!comp.paramValues.empty())
-            snprintf(lbl, sizeof(lbl), "%s=%s", comp.instanceName.c_str(), comp.paramValues[0].c_str());
-        else
-            snprintf(lbl, sizeof(lbl), "%s", comp.instanceName.c_str());
-        ImVec2 ls = ImGui::CalcTextSize(lbl);
-        dl->AddText({ctr.x-ls.x*.5f, ctr.y+bys+2*zoom_}, IM_COL32(170,200,170,255), lbl);
+        // Instance name label (suppressed for JUNC/NETLABEL/TX_WIND/TXN_CUSTOM)
+        if (comp.typeId != "JUNC" && comp.typeId != "NETLABEL" &&
+            comp.typeId != "TX_WIND" && comp.typeId != "TXN_CUSTOM") {
+            char lbl[80];
+            if (!comp.paramValues.empty())
+                snprintf(lbl, sizeof(lbl), "%s=%s", comp.instanceName.c_str(), comp.paramValues[0].c_str());
+            else
+                snprintf(lbl, sizeof(lbl), "%s", comp.instanceName.c_str());
+            ImVec2 ls = ImGui::CalcTextSize(lbl);
+            dl->AddText({ctr.x-ls.x*.5f, ctr.y+bys+2*zoom_}, IM_COL32(170,200,170,255), lbl);
+        } else if (comp.typeId == "TX_WIND" && comp.paramValues.size() >= 3) {
+            // Show txGroup:turns above the winding
+            char lbl[64];
+            snprintf(lbl, sizeof(lbl), "%s n=%s", comp.paramValues[0].c_str(), comp.paramValues[2].c_str());
+            ImVec2 ls = ImGui::CalcTextSize(lbl);
+            dl->AddText({ctr.x-ls.x*.5f, ctr.y-bys-14*zoom_}, IM_COL32(170,200,170,255), lbl);
+        }
 
         // ── Pins (mirrorX + rotated positions) ───────────────────────────
+        if (comp.typeId != "JUNC")
         for (int pi = 0; pi < (int)td->pins.size(); ++pi) {
             ImVec2 pinCanvas = pinCanvasPos(comp, pi);
             ImVec2 pinScr    = c2s(pinCanvas, origin);

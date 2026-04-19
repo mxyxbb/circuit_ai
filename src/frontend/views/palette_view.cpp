@@ -16,6 +16,7 @@ void PaletteView::render(MainViewModel& vm) {
     const float btnW = ImGui::GetContentRegionAvail().x;
 
     for (const auto& type : SchematicModel::compTypes()) {
+        if (type.id == "TX_WIND" || type.id == "TX_CORE") continue;
         ImGui::PushID(type.id.c_str());
 
         // Full-width button as the drag source
