@@ -1,1 +1,2 @@
 rm -rf build/CMakeCache.txt build/CMakeFiles && cmake -B build -G "Visual Studio 17 2022" -A x64 2>&1 | tail -10
+cmake --build build --config Release 2>&1
