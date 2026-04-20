@@ -999,52 +999,50 @@ void SchematicView::drawCompSymbol(ImDrawList* dl, const SchematicComp& comp,
     // User coords (x,y) Y-up → canvas sc(x, -y). G(-20,0)→extends to sc(-40,0).
     else if (id == "S") {
         // G lead: model G pin → gate bar
-        dl->AddLine(sc(-40,  0), sc(0,  0), col, thick);
+        dl->AddLine(sc(-20,  0), sc(-5,  0), col, thick);
         // GRef lead: model GRef pin → gate bar bottom
-        dl->AddLine(sc(-40, +20), sc(0, +20), col, thick);
+        dl->AddLine(sc(-20, +20), sc(-5, +20), col, thick);
         // Gate bar: (0,15)→(0,-20) user = sc(0,-15)→sc(0,+20)
-        dl->AddLine(sc(0, -15), sc(0, +20), col, thick);
+        dl->AddLine(sc(-5, -15), sc(-5, +20), col, thick);
 
         // Channel: 3 segments at x=5
-        dl->AddLine(sc(5, -20), sc(5, -10), col, thick);  // (5,20)→(5,10)
-        dl->AddLine(sc(5,  -5), sc(5,  +5), col, thick);  // (5,5)→(5,-5)
-        dl->AddLine(sc(5, +10), sc(5, +20), col, thick);  // (5,-10)→(5,-20)
+        dl->AddLine(sc(0, -20), sc(0, -10), col, thick);  // (5,20)→(5,10)
+        dl->AddLine(sc(0,  -5), sc(0,  +5), col, thick);  // (5,5)→(5,-5)
+        dl->AddLine(sc(0, +10), sc(0, +20), col, thick);  // (5,-10)→(5,-20)
 
         // Horizontal stubs: drain y=-15, body y=0, source y=+15
-        dl->AddLine(sc(5, -15), sc(15, -15), col, thick);
-        dl->AddLine(sc(5,   0), sc(15,   0), col, thick);
-        dl->AddLine(sc(5, +15), sc(15, +15), col, thick);
+        dl->AddLine(sc(0, -15), sc(20, -15), col, thick);
+        dl->AddLine(sc(0,   0), sc(20,   0), col, thick);
+        dl->AddLine(sc(0, +15), sc(20, +15), col, thick);
 
         // D vertical (15,15)→(15,25): drain stub → up  = sc(15,-15)→sc(15,-25)
-        dl->AddLine(sc(15, -15), sc(15, -25), col, thick);
+        dl->AddLine(sc(20, -15), sc(20, -25), col, thick);
         // S vertical (15,0)→(15,-25): body stub → down = sc(15,0)→sc(15,+25)
-        dl->AddLine(sc(15,   0), sc(15, +25), col, thick);
+        dl->AddLine(sc(20,   0), sc(20, +25), col, thick);
 
         // D horizontal (15,20)→(23,20) = sc(15,-20)→sc(23,-20)
-        dl->AddLine(sc(15, -20), sc(23, -20), col, thick);
+        dl->AddLine(sc(20, -20), sc(33, -20), col, thick);
         // S horizontal (15,-20)→(23,-20) = sc(15,+20)→sc(23,+20)
-        dl->AddLine(sc(15, +20), sc(23, +20), col, thick);
+        dl->AddLine(sc(20, +20), sc(33, +20), col, thick);
 
         // Outer bar (23,20)→(23,-20): split for body diode gap at y=-5..+10
-        dl->AddLine(sc(23, -20), sc(23,  -5), col, thick);  // upper
-        dl->AddLine(sc(23, +10), sc(23, +20), col, thick);  // lower
+        dl->AddLine(sc(33, -20), sc(33,  -5), col, thick);  // upper
+        dl->AddLine(sc(33, +5), sc(33, +20), col, thick);  // lower
 
         // D pin lead: sc(0,-40)→sc(0,-25)→sc(15,-25)  [L to D vertical top]
-        dl->AddLine(sc(0, -40), sc(0,  -25), col, thick);
-        dl->AddLine(sc(0, -25), sc(15, -25), col, thick);
+        dl->AddLine(sc(20, -40), sc(20,  -25), col, thick);
 
         // S pin lead: sc(15,+25)→sc(15,+40)→sc(0,+40)  [L from S vertical bottom]
-        dl->AddLine(sc(15, +25), sc(15, +40), col, thick);
-        dl->AddLine(sc(15, +40), sc(0,  +40), col, thick);
+        dl->AddLine(sc(20, +25), sc(20, +40), col, thick);
 
         // Body arrow: left-pointing, tip at sc(0,0), base at sc(5,±5)
-        dl->AddTriangleFilled(sc(5, 0), sc(10, -5), sc(10, +5), col);
+        dl->AddTriangleFilled(sc(0, 0), sc(10, -5), sc(10, +5), col);
 
         // Body diode: up-pointing, cathode tip at sc(23,-5)
         // Cathode bar (23-5,5)→(23+5,5) = sc(18,-5)→sc(28,-5)
-        dl->AddLine(sc(18, -5), sc(28, -5), col, thick);
+        dl->AddLine(sc(28, -5), sc(38, -5), col, thick);
         // Diode triangle: tip sc(23,-5), anode base sc(18,+10)→sc(28,+10)
-        dl->AddTriangleFilled(sc(23, -5), sc(18, +10), sc(28, +10), col);
+        dl->AddTriangleFilled(sc(33, -5), sc(28, +5), sc(38, +5), col);
 
         // Pin labels
         ImU32 lblCol = sel ? IM_COL32(255,230,100,220) : IM_COL32(160,200,255,200);
@@ -1054,10 +1052,10 @@ void SchematicView::drawCompSymbol(ImDrawList* dl, const SchematicComp& comp,
             ImVec2 ts = ImGui::CalcTextSize(txt);
             dl->AddText(nullptr, lsz, ImVec2{ps.x + dx*z - ts.x*.5f, ps.y + dy*z - ts.y*.5f}, lblCol, txt);
         };
-        addPL(-40,   0, -1.8f,  0.0f, "G");
-        addPL(-40, +20, -1.8f,  0.0f, "Ref");
-        addPL(  0, -40,  0.0f, -1.8f, "D");
-        addPL(  0, +40,  0.0f, +1.8f, "S");
+        addPL(-20,   -10, -1.8f,  0.0f, "G");
+        addPL(-20, +30, -1.8f,  0.0f, "Ref");
+        addPL(  10, -40,  0.0f, -1.8f, "D");
+        addPL(  10, +40,  0.0f, +1.8f, "S");
     }
     // ── Transformer 2-winding (turns ratio label) ─────────────────────────
     else if (id == "TX") {
