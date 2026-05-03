@@ -18,7 +18,13 @@ public:
         if (count_ < capacity_) count_++;
     }
 
-    void clear() { offset_ = 0; count_ = 0; }
+    // Bumped on clear() and copy assignment so render-side caches can detect
+    // "buffer reset / replaced" even when the new sample count happens to
+    // match the old (e.g. retroComputeSig clears then refills the same number
+    // of points). push() does NOT bump — incremental decimation needs the
+    // generation to stay stable across appends.
+    void clear() { offset_ = 0; count_ = 0; ++generation_; }
+    int  generation() const { return generation_; }
 
     // For ImPlot: returns pointer to contiguous data.
     // If buffer hasn't wrapped, data is [0..count_).
@@ -29,6 +35,16 @@ public:
     int getCount() const { return static_cast<int>(count_); }
     int getOffset() const { return static_cast<int>(offset_); }
     size_t capacity() const { return capacity_; }
+
+    // Indexed access: logical index 0 = oldest sample
+    double getXAt(int i) const {
+        size_t phys = (count_ < capacity_) ? (size_t)i : (offset_ + (size_t)i) % capacity_;
+        return xData_[phys];
+    }
+    double getYAt(int i) const {
+        size_t phys = (count_ < capacity_) ? (size_t)i : (offset_ + (size_t)i) % capacity_;
+        return yData_[phys];
+    }
 
     // ImPlot::SetNextPlotDataRange uses offset for ring buffers:
     // ImPlot can render from (offset % capacity) with count elements.
@@ -48,4 +64,5 @@ private:
     size_t count_;
     std::vector<double> xData_;
     std::vector<double> yData_;
+    int    generation_ = 0;   // bumped on clear(); render caches compare against this
 };

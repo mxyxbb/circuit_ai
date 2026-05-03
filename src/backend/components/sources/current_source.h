@@ -14,6 +14,10 @@ public:
         solver.stampRhs(nn_, -i_);
     }
 
+    double getBranchCurrent(const Eigen::VectorXd&, size_t) const override {
+        return i_;
+    }
+
 private:
     std::string name_;
     int np_, nn_;

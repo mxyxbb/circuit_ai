@@ -3,6 +3,7 @@
 #include "components/base_component.h"
 #include <chrono>
 #include <cstdio>
+#include <thread>
 
 Simulator::Simulator() : solver_(std::make_unique<MNASolver>()) {}
 Simulator::~Simulator() { stop(); }
@@ -39,13 +40,21 @@ bool Simulator::setup(const Circuit& circuit, const SimConfig& config,
             pme.kind = ProbeMapEntry::NodeVoltage;
             pme.absIndex = static_cast<size_t>(probe.index - 1); // 0-based
         } else {
-            // BranchCurrent: find component
-            std::string compName = probe.name.substr(2, probe.name.size() - 3);
+            // BranchCurrent: find component, stripping optional _Wk suffix
+            std::string nameArg = probe.name.substr(2, probe.name.size() - 3);
+            std::string compName = nameArg;
+            size_t wPos = nameArg.rfind("_W");
+            if (wPos != std::string::npos && wPos + 2 < nameArg.size()) {
+                bool allDigit = true;
+                for (size_t i = wPos + 2; i < nameArg.size(); ++i)
+                    if (!std::isdigit((unsigned char)nameArg[i])) { allDigit = false; break; }
+                if (allDigit) compName = nameArg.substr(0, wPos);
+            }
             const BaseComponent* comp = circuit.findComponent(compName);
             if (!comp) continue;
 
             if (comp->extraVariableCount() > 0) {
-                // Has extra variable: read current directly from x
+                // Has extra variable: read current from x[compExtraAbs + windingOffset]
                 pme.kind = ProbeMapEntry::ExtraCurrent;
                 size_t ci = 0;
                 for (const auto& c : circuit.components()) {
@@ -53,7 +62,7 @@ bool Simulator::setup(const Circuit& circuit, const SimConfig& config,
                     ci++;
                 }
                 if (ci < compExtraAbs_.size()) {
-                    pme.absIndex = compExtraAbs_[ci];
+                    pme.absIndex = compExtraAbs_[ci] + static_cast<size_t>(probe.index);
                 }
             } else {
                 // No extra variable (resistor, diode): compute from node voltages
@@ -144,7 +153,7 @@ void Simulator::runLoop() {
 }
 
 bool Simulator::step() {
-    constexpr int MAX_ITER     = 20;
+    constexpr int MAX_ITER     = 50;
     constexpr int MAX_ZC_BISECT = 8;  // dt / 2^8 = dt/256 crossing accuracy
     const double dt = config_.dt;
     double t = t_.load();
@@ -165,6 +174,7 @@ bool Simulator::step() {
     auto innerSolve = [&](double stepDt, double atT) -> bool {
         bool converged = true;
         for (int iter = 0; iter < MAX_ITER; ++iter) {
+            if (stopRequested_.load(std::memory_order_relaxed)) return false;
             solver_->clear();
             solver_->applyGmin(1e-12);
             size_t ci = 0;
@@ -211,6 +221,7 @@ bool Simulator::step() {
         // dtHi = smallest sub-step with net state change  (post-crossing ≈ t_zc)
         double dtLo = 0.0, dtHi = dt;
         for (int b = 0; b < MAX_ZC_BISECT; ++b) {
+            if (stopRequested_.load(std::memory_order_relaxed)) break;
             double dtMid = (dtLo + dtHi) * 0.5;
             for (const auto& comp : circuit_->components()) {
                 comp->restoreState();
@@ -272,7 +283,13 @@ bool Simulator::step() {
             }
             }
         }
-        ringBuffer_.push(sample);
+        // Block until consumer drains a slot. Without this, a momentarily slow
+        // main thread (e.g. opening the scope window) would silently drop
+        // samples and leave gaps in the captured waveform.
+        while (!ringBuffer_.push(sample)) {
+            if (stopRequested_.load(std::memory_order_relaxed)) break;
+            std::this_thread::yield();
+        }
     }
 
     t_ = t + stepDt;

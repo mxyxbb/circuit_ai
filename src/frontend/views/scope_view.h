@@ -1,6 +1,7 @@
 #pragma once
 #include "views/base_view.h"
 #include <vector>
+#include <iosfwd>
 #include <imgui.h>    // ImVec2
 #include <implot.h>   // ImPlotPoint
 
@@ -36,10 +37,39 @@ struct ZoomSnapshot {
 
 class ScopeView : public BaseView {
 public:
-    ScopeView();
+    explicit ScopeView(int scopeIdx = 0);
     void render(MainViewModel& vm) override;
 
+    int  scopeIndex() const { return scopeIdx_; }
+    // Only updates the lookup index; title is fixed at construction so ImGui
+    // dock state is not disturbed when scopes are re-indexed after removal.
+    void setScopeIndex(int idx) { scopeIdx_ = idx; }
+
+    // Center this scope in the viewport on its first render (used for newly created scopes).
+    // If imgui.ini already has a saved position, the saved position is used instead.
+    void setCenterOnFirstRender() { centerOnFirstRender_ = true; }
+
+    // Scope layout persistence (called by SchematicView save/load).
+    // sourceSchId tags every loaded MuxEntry with the SchematicDoc::id of the
+    // owning sch, so ownership routing knows which sch a scope belongs to.
+    void saveState(std::ostream& out, const MainViewModel& vm) const;
+    void loadState(std::istream& in, MainViewModel& vm, int sourceSchId = -1);
+    PlotYState getPlotYState(int idx) const {
+        if (idx >= 0 && idx < (int)plotYStates_.size()) return plotYStates_[idx];
+        return {-1.0, 1.0, false};
+    }
+
+    // Window-geometry overrides applied on the next render. Used when restoring
+    // a scope from a .sch file: the saved Pos/Size must override imgui.ini.
+    void setPendingWindowGeometry(const ImVec2& pos, const ImVec2& size) {
+        pendingPos_ = pos; pendingSize_ = size; pendingGeoSet_ = true;
+    }
+
 private:
+    int  scopeIdx_ = 0;          // which ScopeModel in MainViewModel this view tracks
+    bool pendingXRestore_ = false;  // if true, apply pendingX* on next tEnd change
+    double pendingXMin_   = 0.0;
+    double pendingXMax_   = 0.01;
     // ── Rendering ────────────────────────────────────────────────────────────
     void renderPlot(MainViewModel& vm, PlotArea& plot, int plotIndex, float plotHeight, bool isBottom);
     void renderPlotContextMenu(MainViewModel& vm, int plotIndex);
@@ -106,6 +136,14 @@ private:
     // Reset to false at the start of each render() call.
     bool plotStructureChanged_ = false;
 
-    // Per-frame decimation workspace — reused across signals each frame
-    std::vector<double> decX_, decY_;
+    // Persistent cursor (set by single-click, cleared via context menu)
+    bool   cursorActive_ = false;
+    double cursorX_      = 0.0;
+
+    bool   centerOnFirstRender_ = false;
+
+    // Pending window geometry override (set by setPendingWindowGeometry).
+    bool   pendingGeoSet_ = false;
+    ImVec2 pendingPos_    = {0, 0};
+    ImVec2 pendingSize_   = {900, 450};
 };

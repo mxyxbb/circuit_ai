@@ -18,7 +18,7 @@ static const std::vector<CompTypeDef> s_compTypes = {
       {24,14} },
 
     { "C",        "Capacitor",      "C",
-      { {"P",{-40,0}}, {"N",{40,0}} },
+      { {"P",{-20,0}}, {"N",{20,0}} },
       { {"C (F)", "1u"} },
       {24,14} },
 
@@ -60,7 +60,7 @@ static const std::vector<CompTypeDef> s_compTypes = {
     { "S",        "Switch",         "S",
       { {"D",{20,-40}}, {"S",{20,+40}}, {"G",{-20,0}}, {"GRef",{-20,+20}} },
       {},
-      {22,44} },
+      {40,44} },
 
     { "TX",       "Transformer",    "TX",
       { {"P1",{-40,-20}}, {"N1",{-40,20}}, {"P2",{40,-20}}, {"N2",{40,20}} },
@@ -455,7 +455,26 @@ std::string SchematicModel::generateNetlist(const SchematicSimConfig& cfg) const
         if (comp.typeId == "GND"      || comp.typeId == "TX_WIND" ||
             comp.typeId == "JUNC"     || comp.typeId == "NETLABEL" ||
             comp.typeId == "TXN_CUSTOM") continue;
-        oss << ".PROBE I(" << comp.instanceName << ")\n";
+        if (comp.typeId == "TX") {
+            oss << ".PROBE I(" << comp.instanceName << ")\n";    // winding 0
+            oss << ".PROBE I(" << comp.instanceName << "_W1)\n"; // winding 1
+        } else if (comp.typeId == "TX3") {
+            oss << ".PROBE I(" << comp.instanceName << ")\n";
+            oss << ".PROBE I(" << comp.instanceName << "_W1)\n";
+            oss << ".PROBE I(" << comp.instanceName << "_W2)\n";
+        } else if (comp.typeId == "TX_CORE") {
+            if (comp.paramValues.empty()) { oss << ".PROBE I(" << comp.instanceName << ")\n"; continue; }
+            const std::string& grp = comp.paramValues[0];
+            int nWinds = 0;
+            for (const auto& wc : comps_)
+                if (wc.typeId == "TX_WIND" && !wc.paramValues.empty() && wc.paramValues[0] == grp)
+                    ++nWinds;
+            oss << ".PROBE I(" << comp.instanceName << ")\n";
+            for (int w = 1; w < nWinds; ++w)
+                oss << ".PROBE I(" << comp.instanceName << "_W" << w << ")\n";
+        } else {
+            oss << ".PROBE I(" << comp.instanceName << ")\n";
+        }
     }
     oss << ".END\n";
 
@@ -598,4 +617,27 @@ bool SchematicModel::loadFromFile(const std::string& path) {
     }
 
     return true;
+}
+
+std::string SchematicModel::getNetNameForNode(int nodeId) const {
+    auto nodeMap = computePinNodeMap();
+    for (const auto& w : wires_) {
+        if (w.netName.empty()) continue;
+        auto it = nodeMap.find(pinKey(w.fromCompId, w.fromPinIdx));
+        if (it != nodeMap.end() && it->second == nodeId)
+            return w.netName;
+    }
+    return "";
+}
+
+std::unordered_map<std::string, int> SchematicModel::computeNetNameToNodeMap() const {
+    auto nodeMap = computePinNodeMap();
+    std::unordered_map<std::string, int> result;
+    for (const auto& w : wires_) {
+        if (w.netName.empty()) continue;
+        auto it = nodeMap.find(pinKey(w.fromCompId, w.fromPinIdx));
+        if (it != nodeMap.end() && it->second != 0)
+            result[w.netName] = it->second;
+    }
+    return result;
 }

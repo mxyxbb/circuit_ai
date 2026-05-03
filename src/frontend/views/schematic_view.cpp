@@ -11,24 +11,35 @@
 #endif
 
 #include "views/schematic_view.h"
+#include "views/scope_view.h"
 #include "view_model/main_view_model.h"
+#include "view_model/scope_model.h"
 #include "view_model/schematic_model.h"
+#include "platform/file_dialog.h"
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <cmath>
+#include <cctype>
 #include <cstring>
 #include <algorithm>
 #include <unordered_map>
+#include <unordered_set>
+#include <fstream>
+#include <sstream>
 
 // ── Win32 file dialog helpers ──────────────────────────────────────────────
+// OFN_NOCHANGEDIR: prevents the dialog from mutating the process CWD when the
+// user navigates to another folder. Without this, autosave/session files end
+// up wherever the user last browsed instead of beside the exe.
 #ifdef _WIN32
+
 static bool pickOpenPath(char* buf, int n) {
     OPENFILENAMEA ofn = {};
     ofn.lStructSize = sizeof(ofn);
     ofn.lpstrFilter = "CircuitAI Schematic\0*.sch\0All Files\0*.*\0\0";
     ofn.lpstrFile   = buf;
     ofn.nMaxFile    = static_cast<DWORD>(n);
-    ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
     ofn.lpstrDefExt = "sch";
     buf[0] = '\0';
     return GetOpenFileNameA(&ofn) != 0;
@@ -39,7 +50,7 @@ static bool pickSavePath(char* buf, int n) {
     ofn.lpstrFilter = "CircuitAI Schematic\0*.sch\0All Files\0*.*\0\0";
     ofn.lpstrFile   = buf;
     ofn.nMaxFile    = static_cast<DWORD>(n);
-    ofn.Flags       = OFN_OVERWRITEPROMPT;
+    ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR;
     ofn.lpstrDefExt = "sch";
     buf[0] = '\0';
     return GetSaveFileNameA(&ofn) != 0;
@@ -105,21 +116,372 @@ ImVec2 SchematicView::pinCanvasPos(const SchematicComp& comp, int pi) {
     return { comp.pos.x + roff.x, comp.pos.y + roff.y };
 }
 
+// ── Save / Load with scope state ──────────────────────────────────────────
+// Persistence file names — resolved via platform::appDataPath() so they always
+// land beside the exe regardless of CWD changes from native file dialogs.
+static const char* kSessionFileName = "session.txt";
+static const char* kAutoSaveName    = "autosave.sch";  // legacy single-file fallback
+static std::string kSessionFile() { return platform::appDataPath(kSessionFileName); }
+
+// Helper: derive a tab label from a file path (basename without extension).
+static std::string deriveDisplayName(const std::string& path) {
+    if (path.empty()) return "Untitled";
+    std::string name = path;
+    auto pos = name.find_last_of("/\\");
+    if (pos != std::string::npos) name = name.substr(pos + 1);
+    return name;
+}
+
+void SchematicView::performAutoSave(MainViewModel& vm) {
+    // Per user request: do NOT auto-save .sch contents. Only the user's explicit
+    // Save / Save As writes a .sch file. We still record session.txt so that
+    // previously-saved tabs can be restored on next launch — untitled docs are
+    // discarded on close.
+    std::ofstream sf(kSessionFile());
+    if (!sf.good()) return;
+
+    // Map original doc indices to session positions so ACTIVE= still points
+    // at the right tab after we filter out untitled docs.
+    int activeOrig = vm.activeSchIdx();
+    int activeSession = -1;
+    int sessionPos = 0;
+    std::vector<std::string> savedPaths;
+    for (int i = 0; i < vm.schDocCount(); i++) {
+        const SchematicDoc& doc = vm.schDoc(i);
+        if (doc.filePath.empty()) continue;
+        if (i == activeOrig) activeSession = sessionPos;
+        savedPaths.push_back(doc.filePath);
+        sessionPos++;
+    }
+    if (activeSession < 0) activeSession = 0;
+    sf << "ACTIVE=" << activeSession << '\n';
+    for (const auto& p : savedPaths) sf << "PATH=" << p << '\n';
+}
+
+void SchematicView::doSave(const std::string& path, MainViewModel& vm, bool silent,
+                            int docIdx, bool includeScopeState) {
+    if (docIdx < 0) docIdx = vm.activeSchIdx();
+    if (docIdx < 0 || docIdx >= vm.schDocCount()) return;
+    SchematicDoc& doc = vm.schDoc(docIdx);
+    SchematicModel& sch = doc.model;
+    bool ok = sch.saveToFile(path);
+    if (!ok) {
+        if (!silent) {
+            std::snprintf(ioStatus_, sizeof(ioStatus_), "Save failed!");
+            ioStatusTimer_ = 2.5f;
+        }
+        return;
+    }
+    if (!includeScopeState) {
+        if (!silent) {
+            doc.filePath    = path;
+            doc.displayName = deriveDisplayName(path);
+            if (docIdx == vm.activeSchIdx()) savedFilePath_ = path;
+            std::snprintf(ioStatus_, sizeof(ioStatus_), "Saved.");
+            ioStatusTimer_ = 2.5f;
+        }
+        return;
+    }
+    // Append scope layout — only scopes whose computed owner == this doc's id.
+    // Scopes with mixed sources (owner = -1) are NOT saved with any sch.
+    {
+        std::ofstream f(path, std::ios::app);
+        std::ostringstream ss;
+
+        // Collect scope views whose model is owned by this doc.
+        std::vector<ScopeView*> ownedViews;
+        for (ScopeView* sv : scopeViews_) {
+            const ScopeModel& scope = vm.scope(sv->scopeIndex());
+            if (scope.computeOwnerSchId() == doc.id)
+                ownedViews.push_back(sv);
+        }
+
+        ss << "XSCOPE_N " << (int)ownedViews.size() << '\n';
+        for (ScopeView* sv : ownedViews) {
+            int        idx   = sv->scopeIndex();
+            ScopeModel& scope = vm.scope(idx);
+            sv->saveState(ss, vm);  // writes XSCOPE/XSCOPEGEO/XCSIG lines
+            for (int pi = 0; pi < scope.plotCount(); pi++) {
+                const PlotArea* plot = scope.getPlot(pi);
+                if (!plot) continue;
+                ss << "PLOT " << plot->title << '\n';
+                for (const auto& entry : plot->entries) {
+                    char buf[512];
+                    std::snprintf(buf, sizeof(buf), "XSIG %s|%s|%g|%s|%08X\n",
+                        entry->signalName.c_str(), entry->label.c_str(),
+                        entry->scale, entry->signalNameB.c_str(),
+                        (unsigned int)entry->color);
+                    ss << buf;
+                }
+                PlotYState pys = sv->getPlotYState(pi);
+                ss << "YRANGE " << pys.yMin << ' ' << pys.yMax << '\n';
+            }
+            ss << "ENDSCOPE\n";
+        }
+        f << ss.str();
+    }
+    if (!silent) {
+        doc.filePath    = path;
+        doc.displayName = deriveDisplayName(path);
+        if (docIdx == vm.activeSchIdx()) savedFilePath_ = path;
+        std::snprintf(ioStatus_, sizeof(ioStatus_), "Saved.");
+        ioStatusTimer_ = 2.5f;
+    }
+}
+
+void SchematicView::doLoad(const std::string& path, MainViewModel& vm) {
+    // If the path is already open, just switch to that tab.
+    int existing = vm.findSchDocByPath(path);
+    if (existing >= 0) {
+        vm.setActiveSchIdx(existing);
+        savedFilePath_ = path;
+        std::snprintf(ioStatus_, sizeof(ioStatus_), "Already open.");
+        ioStatusTimer_ = 2.5f;
+        return;
+    }
+
+    // If the active doc is empty (untitled, no components), load INTO it.
+    // Otherwise create a fresh doc.
+    int targetIdx = vm.activeSchIdx();
+    if (targetIdx < 0 || vm.schDoc(targetIdx).model.comps().size() > 0
+        || !vm.schDoc(targetIdx).filePath.empty()) {
+        targetIdx = vm.newSchDoc();
+    }
+    SchematicDoc& doc = vm.schDoc(targetIdx);
+    SchematicModel& sch = doc.model;
+    bool ok = sch.loadFromFile(path);
+    if (ok) {
+        selectedCompId_ = selectedWireId_ = propEditCompId_ = movingCompId_ = -1;
+        multiSelectedIds_.clear(); multiMoveOrigPos_.clear(); selBoxActive_ = false;
+        wiringActive_ = false;
+        doc.undoStack.clear(); doc.redoStack.clear();
+        undoStack_.clear(); redoStack_.clear();
+        doc.filePath    = path;
+        doc.displayName = deriveDisplayName(path);
+
+        {
+            std::ifstream f(path);
+            std::string line;
+            int scopeIdx = -1;       // local index within this sch's saved scopes
+            // Reuse trailing empty scopes (e.g. the placeholder ScopeModel created
+            // in MainViewModel's constructor) so a restored scope occupies their
+            // slots instead of being appended after them. Without this, an empty
+            // scope 0 lingers and gets auto-populated with all signals on Build.
+            int firstNewScope = vm.scopeCount();
+            while (firstNewScope > 0) {
+                const ScopeModel& sc = vm.scope(firstNewScope - 1);
+                bool empty = true;
+                for (int pi = 0; pi < sc.plotCount(); pi++) {
+                    const PlotArea* p = sc.getPlot(pi);
+                    if (p && !p->entries.empty()) { empty = false; break; }
+                }
+                if (!empty) break;
+                firstNewScope--;
+            }
+            bool inBlock = false;
+            std::ostringstream block;
+
+            while (std::getline(f, line)) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+
+                // XSCOPE_N: number of scopes saved with this sch
+                if (line.size() > 8 && line.substr(0, 8) == "XSCOPE_N") {
+                    int n = 0;
+                    std::istringstream ss(line.substr(8));
+                    ss >> n;
+                    // Add n new scopes (each will be tagged with this doc's id)
+                    while (vm.scopeCount() < firstNewScope + n) vm.addScope();
+                    continue;
+                }
+
+                // XSCOPE <xMin> <xMax>: start of a scope block
+                if (line.size() > 7 && line.substr(0, 7) == "XSCOPE ") {
+                    scopeIdx++;
+                    int absIdx = firstNewScope + scopeIdx;
+                    while (vm.scopeCount() <= absIdx) vm.addScope();
+                    inBlock = true;
+                    block.str(""); block.clear();
+                    block << line.substr(7) << '\n';
+                    continue;
+                }
+
+                if (inBlock) {
+                    block << line << '\n';
+                    if (line == "ENDSCOPE") {
+                        inBlock = false;
+                        int absIdx = firstNewScope + scopeIdx;
+                        // Defer to the scope view if it exists; else stash on the model
+                        // so the soon-to-be-created ScopeView can apply it.
+                        if (absIdx < (int)scopeViews_.size()) {
+                            std::istringstream bss(block.str());
+                            scopeViews_[absIdx]->loadState(bss, vm, doc.id);
+                            // Loaded scopes are restored visible regardless of the
+                            // ScopeView's hidden default.
+                            scopeViews_[absIdx]->setVisible(true);
+                        } else {
+                            vm.scope(absIdx).setPendingLoadBlock(block.str(), doc.id);
+                            // Auto-sync in MainView::render creates the missing
+                            // ScopeView with visible=true so the pending block
+                            // gets consumed on its first render.
+                        }
+                    }
+                }
+            }
+        }
+        vm.setActiveSchIdx(targetIdx);
+        savedFilePath_ = path;
+    }
+    std::snprintf(ioStatus_, sizeof(ioStatus_), ok ? "Loaded." : "Load failed!");
+    ioStatusTimer_ = 2.5f;
+}
+
+// ── Undo helper ────────────────────────────────────────────────────────────
+
+static void pushUndo(std::deque<SchematicModel>& undoStack,
+                     std::deque<SchematicModel>& redoStack,
+                     const SchematicModel& current,
+                     int maxUndo)
+{
+    redoStack.clear();
+    undoStack.push_back(current);
+    while ((int)undoStack.size() > maxUndo)
+        undoStack.pop_front();
+}
+
 // ── Main render ────────────────────────────────────────────────────────────
 
 void SchematicView::render(MainViewModel& vm) {
+    // ── Auto-restore last session (runs once on first render) ─────────────
+    if (pendingAutoLoad_) {
+        pendingAutoLoad_ = false;
+        std::ifstream sf(kSessionFile());
+        if (sf.good()) {
+            std::vector<std::string> paths;
+            int activeIdx = 0;
+            std::string line;
+            while (std::getline(sf, line)) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (line.rfind("ACTIVE=", 0) == 0) {
+                    try { activeIdx = std::stoi(line.substr(7)); } catch (...) {}
+                } else if (line.rfind("PATH=", 0) == 0) {
+                    paths.push_back(line.substr(5));
+                } else if (!line.empty() && line.find('=') == std::string::npos) {
+                    // Backward-compat: legacy single-path session.txt format
+                    paths.push_back(line);
+                }
+            }
+            // Load each path as its own tab; track auto-save fallbacks specially
+            // (so Ctrl+S re-prompts for a real path on restore).
+            for (const auto& p : paths) {
+                if (p.empty()) continue;
+                if (!std::ifstream(p).good()) continue;
+                doLoad(p, vm);
+                // Detect auto-save fallback files (legacy or per-doc) by basename
+                std::string base = p;
+                {
+                    auto pos = base.find_last_of("/\\");
+                    if (pos != std::string::npos) base = base.substr(pos + 1);
+                }
+                bool isAutoSave = (base == kAutoSaveName) || base.rfind("autosave_", 0) == 0;
+                if (isAutoSave) {
+                    SchematicDoc& d = vm.activeSchDoc();
+                    d.filePath.clear();
+                    d.displayName = "Untitled-restored";
+                }
+            }
+            if (activeIdx >= 0 && activeIdx < vm.schDocCount())
+                vm.setActiveSchIdx(activeIdx);
+        }
+    }
+
     if (!visible_) return;
     if (!ImGui::Begin(title_.c_str(), &visible_)) {
         ImGui::End();
         return;
     }
 
+    // ── Multi-doc tab bar ─────────────────────────────────────────────────
+    {
+        ImGuiTabBarFlags tbFlags =
+            ImGuiTabBarFlags_Reorderable |
+            ImGuiTabBarFlags_AutoSelectNewTabs |
+            ImGuiTabBarFlags_FittingPolicyScroll;
+        if (ImGui::BeginTabBar("##sch_doctabs", tbFlags)) {
+            int closeRequest = -1;
+            int prevActive   = vm.activeSchIdx();
+            for (int i = 0; i < vm.schDocCount(); i++) {
+                SchematicDoc& doc = vm.schDoc(i);
+                bool open = true;
+                std::string label = doc.displayName + "##doc" + std::to_string(doc.id);
+                if (ImGui::BeginTabItem(label.c_str(), &open, ImGuiTabItemFlags_None)) {
+                    if (vm.activeSchIdx() != i) vm.setActiveSchIdx(i);
+                    ImGui::EndTabItem();
+                }
+                if (!open) closeRequest = i;
+            }
+            // "+" trailing button = new schematic; tooltip on hover
+            if (ImGui::TabItemButton("+##new_sch_tab",
+                ImGuiTabItemFlags_Trailing | ImGuiTabItemFlags_NoTooltip)) {
+                int newIdx = vm.newSchDoc();
+                vm.setActiveSchIdx(newIdx);
+                // Reset shared canvas state for the new doc
+                selectedCompId_ = selectedWireId_ = propEditCompId_ = movingCompId_ = -1;
+                multiSelectedIds_.clear(); multiMoveOrigPos_.clear();
+                wiringActive_ = false;
+                undoStack_.clear(); redoStack_.clear();
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("New schematic");
+            ImGui::EndTabBar();
+
+            // Process tab-close request after the tab bar (closing during iteration
+            // would invalidate the loop's index assumptions). We DON'T auto-save
+            // and we DON'T call closeSchDoc here — MainView consumes the deferred
+            // request after this frame so it can tear down the doc's ScopeViews,
+            // stop the simulator, and remove the scope models in lockstep.
+            if (closeRequest >= 0) {
+                pendingCloseDocIdx_ = closeRequest;
+                // Reset shared canvas state to avoid stale selection on the new active doc.
+                selectedCompId_ = selectedWireId_ = propEditCompId_ = movingCompId_ = -1;
+                multiSelectedIds_.clear(); multiMoveOrigPos_.clear();
+                wiringActive_ = false;
+                undoStack_.clear(); redoStack_.clear();
+            }
+            // Reset selection when the user switches between existing tabs.
+            if (vm.activeSchIdx() != prevActive) {
+                selectedCompId_ = selectedWireId_ = propEditCompId_ = movingCompId_ = -1;
+                multiSelectedIds_.clear(); multiMoveOrigPos_.clear();
+                wiringActive_ = false;
+                undoStack_.clear(); redoStack_.clear();
+            }
+        }
+    }
+
+    // Sync local savedFilePath_ with the active doc so existing toolbar/Ctrl+S code works.
+    savedFilePath_ = vm.activeSchDoc().filePath;
+
     SchematicModel& sch = vm.schematic();
 
     // ── Toolbar ────────────────────────────────────────────────────────────
     if (ioStatusTimer_ > 0.f) ioStatusTimer_ -= ImGui::GetIO().DeltaTime;
 
-    if (ImGui::Button("Build & Run")) vm.buildFromSchematic();
+    {
+        ImVec2 btnSz = ImGui::CalcTextSize("Build & Run");
+        btnSz.x += ImGui::GetStyle().FramePadding.x * 2.0f;
+        btnSz.y += ImGui::GetStyle().FramePadding.y * 2.0f;
+        bool simActive = (vm.isSimRunning() && !vm.isSimPaused()) || vm.isBuildPending();
+        if (simActive) {
+            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.7f, 0.15f, 0.15f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9f, 0.25f, 0.25f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.5f, 0.10f, 0.10f, 1.0f));
+            if (ImGui::Button("Stop", btnSz)) {
+                vm.cancelBuild();
+                vm.stop();
+            }
+            ImGui::PopStyleColor(3);
+        } else {
+            if (ImGui::Button("Build & Run", btnSz)) vm.requestBuild();
+        }
+    }
     ImGui::SameLine();
     if (ImGui::Button("Clear")) {
         sch.clear();
@@ -131,25 +493,25 @@ void SchematicView::render(MainViewModel& vm) {
 #ifdef _WIN32
     if (ImGui::Button("Save")) {
         char path[512] = {};
-        if (pickSavePath(path, sizeof(path))) {
-            bool ok = sch.saveToFile(path);
-            std::snprintf(ioStatus_, sizeof(ioStatus_), ok ? "Saved." : "Save failed!");
-            ioStatusTimer_ = 2.5f;
+        if (!savedFilePath_.empty()) {
+            // Already has a path: save directly
+            strncpy(path, savedFilePath_.c_str(), sizeof(path)-1);
+            doSave(path, vm);
+        } else if (pickSavePath(path, sizeof(path))) {
+            doSave(path, vm);
         }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Save As...")) {
+        char path[512] = {};
+        if (pickSavePath(path, sizeof(path)))
+            doSave(path, vm);
     }
     ImGui::SameLine();
     if (ImGui::Button("Load")) {
         char path[512] = {};
-        if (pickOpenPath(path, sizeof(path))) {
-            bool ok = sch.loadFromFile(path);
-            if (ok) {
-                selectedCompId_ = selectedWireId_ = propEditCompId_ = movingCompId_ = -1;
-                multiSelectedIds_.clear(); multiMoveOrigPos_.clear(); selBoxActive_ = false;
-                wiringActive_ = false;
-            }
-            std::snprintf(ioStatus_, sizeof(ioStatus_), ok ? "Loaded." : "Load failed!");
-            ioStatusTimer_ = 2.5f;
-        }
+        if (pickOpenPath(path, sizeof(path)))
+            doLoad(path, vm);
     }
     if (ioStatusTimer_ > 0.f) {
         ImGui::SameLine();
@@ -178,24 +540,30 @@ void SchematicView::render(MainViewModel& vm) {
         bool vActive = (probeMode_ == PM_VProbe);
         bool iActive = (probeMode_ == PM_IProbe);
         if (vActive) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f,0.6f,0.2f,1.0f));
-        if (ImGui::SmallButton("V-Probe")) probeMode_ = vActive ? PM_None : PM_VProbe;
+        if (ImGui::SmallButton("V-Probe")) {
+            probeMode_ = vActive ? PM_None : PM_VProbe;
+            if (vActive) { vProbeDragActive_ = false; vProbeNodeA_ = vProbeNodeB_ = -1; }
+        }
         if (vActive) ImGui::PopStyleColor();
         ImGui::SameLine();
         if (iActive) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f,0.6f,0.2f,1.0f));
         if (ImGui::SmallButton("I-Probe")) probeMode_ = iActive ? PM_None : PM_IProbe;
         if (iActive) ImGui::PopStyleColor();
+        vm.setProbeActive(probeMode_ != PM_None);
     }
     ImGui::SameLine();
     ImGui::TextDisabled("|");
     ImGui::SameLine();
     if (wiringActive_) {
         ImGui::TextColored({0.3f,1.0f,0.5f,1.0f}, "[WIRING — click pin to finish / click canvas for waypoint / Esc cancel]");
+    } else if (probeMode_ == PM_VProbe && vProbeDragActive_) {
+        ImGui::TextColored({1.0f,0.85f,0.2f,1.0f}, "[V-PROBE — release on node B for differential V(A-B), or release on same node for V(A)]");
     } else if (probeMode_ == PM_VProbe) {
-        ImGui::TextColored({0.3f,1.0f,0.3f,1.0f}, "[V-PROBE — click a wire to add voltage to selected Scope plot]");
+        ImGui::TextColored({0.3f,1.0f,0.3f,1.0f}, "[V-PROBE — click a wire/node, or press-drag to another node for differential voltage]");
     } else if (probeMode_ == PM_IProbe) {
         ImGui::TextColored({0.3f,1.0f,0.3f,1.0f}, "[I-PROBE — click a pin to add its current to selected Scope plot]");
     } else {
-        ImGui::TextDisabled("LClick=sel/wire  R=rotate  X=mirror  Ctrl+C=copy  RDrag=pan  Scroll=zoom  Del=delete  LDrag(empty)=multisel  Ctrl+LClick=add sel  DblClick wire=net name");
+        ImGui::TextDisabled("LClick=sel/wire  R=rotate  X=mirror  Ctrl+C=copy  RDrag=pan  Scroll=zoom  Del=delete  LDrag=multisel  Ctrl+LClick=add sel  DblClick wire=net name");
     }
     ImGui::Separator();
 
@@ -234,6 +602,7 @@ void SchematicView::render(MainViewModel& vm) {
                          (int)sch.comps().size() + 1);
                 for (int i = 0; i < 6; ++i) snprintf(txNTurns_[i], 16, "%d", i==0?10:1);
             } else {
+                pushUndo(undoStack_, redoStack_, sch, kMaxUndo);
                 sch.addComp(typeId, dropCanvas);
             }
         }
@@ -248,6 +617,41 @@ void SchematicView::render(MainViewModel& vm) {
     drawComponents(dl, vm, origin);
     drawRubberBand(dl, vm, origin);
 
+    // ── V-probe drag highlights ────────────────────────────────────────────
+    if (vProbeDragActive_) {
+        ImVec2 sA = c2s(vProbeCanvasA_, origin);
+        dl->AddCircleFilled(sA, 8.0f * zoom_, IM_COL32(255, 220, 50, 220));
+        dl->AddCircle(sA, 8.0f * zoom_, IM_COL32(255, 255, 120, 255), 0, 2.0f);
+        if (vProbeNodeB_ != -1 && vProbeNodeB_ != vProbeNodeA_) {
+            ImVec2 sB = c2s(vProbeCanvasB_, origin);
+            dl->AddCircleFilled(sB, 8.0f * zoom_, IM_COL32(80, 255, 120, 220));
+            dl->AddCircle(sB, 8.0f * zoom_, IM_COL32(150, 255, 180, 255), 0, 2.0f);
+            dl->AddLine(sA, sB, IM_COL32(255, 220, 50, 120), 1.5f);
+        }
+    }
+
+    // ── Schematic name + simulation status overlay ───────────────────────
+    {
+        // Filename at top-left
+        std::string fnameStr = savedFilePath_.empty() ? "(unsaved)" : savedFilePath_;
+        {
+            auto pos = fnameStr.find_last_of("/\\");
+            if (pos != std::string::npos) fnameStr = fnameStr.substr(pos + 1);
+        }
+        dl->AddText({origin.x + 6.0f, origin.y + 6.0f},
+                    IM_COL32(100, 160, 255, 200), fnameStr.c_str());
+        // Sim status on line below
+        char simTxt[64] = "";
+        double t = vm.currentTime();
+        if (vm.isSimRunning())
+            snprintf(simTxt, sizeof(simTxt), "Running  t = %.4g s", t);
+        else if (vm.isSimPaused())
+            snprintf(simTxt, sizeof(simTxt), "Paused  t = %.4g s", t);
+        if (simTxt[0])
+            dl->AddText({origin.x + 6.0f, origin.y + 20.0f},
+                        IM_COL32(150, 150, 150, 200), simTxt);
+    }
+
     ImGui::EndChild();
 
     renderProperties(vm);
@@ -261,7 +665,40 @@ void SchematicView::render(MainViewModel& vm) {
                                        ImGuiInputTextFlags_EnterReturnsTrue);
         if (commit || ImGui::Button("OK")) {
             SchematicWire* ew = vm.schematic().findWire(editNetWireId_);
-            if (ew) ew->netName = editNetNameBuf_;
+            if (ew) {
+                pushUndo(undoStack_, redoStack_, vm.schematic(), kMaxUndo);
+                // Rename the scope signal to match the new net name
+                auto nodeMap = vm.schematic().computePinNodeMap();
+                auto nit = nodeMap.find(SchematicModel::pinKey(ew->fromCompId, ew->fromPinIdx));
+                if (nit != nodeMap.end() && nit->second != 0) {
+                    int nodeId = nit->second;
+                    // If wire has no name, a NETLABEL on same node is the effective name
+                    std::string netLabelName;
+                    for (const auto& c : vm.schematic().comps())
+                        if (c.typeId == "NETLABEL" && !c.paramValues.empty()) {
+                            auto cit = nodeMap.find(SchematicModel::pinKey(c.id, 0));
+                            if (cit != nodeMap.end() && cit->second == nodeId)
+                                { netLabelName = c.paramValues[0]; break; }
+                        }
+                    std::string oldSig = !ew->netName.empty()
+                        ? ("V(" + ew->netName + ")")
+                        : (!netLabelName.empty()
+                            ? ("V(" + netLabelName + ")")
+                            : ("V(" + std::to_string(nodeId) + ")"));
+                    std::string newSig = (editNetNameBuf_[0] != '\0')
+                        ? ("V(" + std::string(editNetNameBuf_) + ")")
+                        : ("V(" + std::to_string(nodeId) + ")");
+                    vm.renameSignal(oldSig, newSig);
+                    // Sync NETLABEL name on the same net
+                    for (auto& c : vm.schematic().comps())
+                        if (c.typeId == "NETLABEL" && !c.paramValues.empty()) {
+                            auto cit = nodeMap.find(SchematicModel::pinKey(c.id, 0));
+                            if (cit != nodeMap.end() && cit->second == nodeId)
+                                c.paramValues[0] = editNetNameBuf_;
+                        }
+                }
+                ew->netName = editNetNameBuf_;
+            }
             editNetWireId_ = -1;
             ImGui::CloseCurrentPopup();
         }
@@ -281,6 +718,7 @@ void SchematicView::render(MainViewModel& vm) {
         }
         if (ImGui::Button("Create")) {
             SchematicModel& sch = vm.schematic();
+            pushUndo(undoStack_, redoStack_, sch, kMaxUndo);
             // TX_CORE at drop position
             int coreId = sch.addComp("TX_CORE", txNPendingPos_);
             SchematicComp* core = sch.findComp(coreId);
@@ -321,15 +759,57 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
     ImVec2 mousePt       = s2c(mouseScreen, origin);
     const float hitR     = 8.0f / zoom_;
 
-    // ── Escape: cancel wiring ──────────────────────────────────────────────
-    if (wiringActive_ && ImGui::IsKeyPressed(ImGuiKey_Escape)) {
-        wiringActive_ = false; wireFromCompId_ = -1; wireWaypoints_.clear();
+    // ── Escape: cancel wiring / probe drag ────────────────────────────────
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        if (wiringActive_) { wiringActive_ = false; wireFromCompId_ = -1; wireWaypoints_.clear(); }
+        if (vProbeDragActive_) { vProbeDragActive_ = false; vProbeNodeA_ = vProbeNodeB_ = -1; probeMode_ = PM_None; }
+    }
+
+    // ── Ctrl+S: save ──────────────────────────────────────────────────────────
+    if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S)) {
+#ifdef _WIN32
+        if (!savedFilePath_.empty()) {
+            doSave(savedFilePath_, vm);
+        } else {
+            char path[512] = {};
+            if (pickSavePath(path, sizeof(path)))
+                doSave(path, vm);
+        }
+#endif
+    }
+
+    // ── Ctrl+Z: undo / Ctrl+Y or Ctrl+Shift+Z: redo ──────────────────────────
+    if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z) && !ImGui::GetIO().KeyShift) {
+        if (!undoStack_.empty()) {
+            redoStack_.push_back(sch);
+            sch = undoStack_.back();
+            undoStack_.pop_back();
+            // Deselect to avoid dangling references
+            selectedCompId_ = propEditCompId_ = movingCompId_ = selectedWireId_ = -1;
+            multiSelectedIds_.clear(); multiMoveOrigPos_.clear(); moveWaypointOrig_.clear();
+            wiringActive_ = false;
+        }
+    }
+    if (ImGui::GetIO().KeyCtrl &&
+        (ImGui::IsKeyPressed(ImGuiKey_Y) ||
+         (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z)))) {
+        if (!redoStack_.empty()) {
+            undoStack_.push_back(sch);
+            sch = redoStack_.back();
+            redoStack_.pop_back();
+            selectedCompId_ = propEditCompId_ = movingCompId_ = selectedWireId_ = -1;
+            multiSelectedIds_.clear(); multiMoveOrigPos_.clear(); moveWaypointOrig_.clear();
+            wiringActive_ = false;
+        }
     }
 
     // ── R key: rotate selected component(s) ───────────────────────────────
     if (ImGui::IsKeyPressed(ImGuiKey_R)) {
         auto targets = multiSelectedIds_.empty()
             ? std::vector<int>{selectedCompId_} : multiSelectedIds_;
+        bool hasTarget = false;
+        for (int cid : targets) if (sch.findComp(cid)) { hasTarget = true; break; }
+        if (hasTarget) pushUndo(undoStack_, redoStack_, sch, kMaxUndo);
         for (int cid : targets) {
             SchematicComp* c = sch.findComp(cid);
             if (c) c->rotation = (c->rotation + 1) % 4;
@@ -341,6 +821,9 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
     if (ImGui::IsKeyPressed(ImGuiKey_X)) {
         auto targets = multiSelectedIds_.empty()
             ? std::vector<int>{selectedCompId_} : multiSelectedIds_;
+        bool hasTarget = false;
+        for (int cid : targets) if (sch.findComp(cid)) { hasTarget = true; break; }
+        if (hasTarget) pushUndo(undoStack_, redoStack_, sch, kMaxUndo);
         for (int cid : targets) {
             SchematicComp* c = sch.findComp(cid);
             if (c) c->mirrorX = !c->mirrorX;
@@ -354,6 +837,7 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
             ? std::vector<int>{selectedCompId_} : multiSelectedIds_;
         toCopy.erase(std::remove(toCopy.begin(), toCopy.end(), -1), toCopy.end());
         if (!toCopy.empty()) {
+            pushUndo(undoStack_, redoStack_, sch, kMaxUndo);
             std::unordered_map<int,int> idMap;
             std::vector<int> newIds;
             for (int cid : toCopy) {
@@ -376,12 +860,17 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
                 idMap[cid] = newId;
                 newIds.push_back(newId);
             }
-            // Copy wires connecting two copied components
+            // Copy wires connecting two copied components (shift waypoints by same offset)
             auto wireSnap = sch.wires();
             for (const auto& w : wireSnap) {
-                if (idMap.count(w.fromCompId) && idMap.count(w.toCompId))
+                if (idMap.count(w.fromCompId) && idMap.count(w.toCompId)) {
+                    std::vector<ImVec2> shiftedWps;
+                    shiftedWps.reserve(w.waypoints.size());
+                    for (const auto& wp : w.waypoints)
+                        shiftedWps.push_back({wp.x + 40.f, wp.y + 40.f});
                     sch.addWire(idMap[w.fromCompId], w.fromPinIdx,
-                                idMap[w.toCompId],   w.toPinIdx, w.waypoints);
+                                idMap[w.toCompId],   w.toPinIdx, shiftedWps);
+                }
             }
             if (newIds.size() == 1) {
                 selectedCompId_  = newIds[0];
@@ -419,76 +908,234 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
         }
     }
 
-    // ── Probe mode left-click ─────────────────────────────────────────────
-    if (hovered && probeMode_ != PM_None && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-        ScopeModel& scope = vm.scope();
-        int selPlot = scope.selectedPlot();
-        if (probeMode_ == PM_VProbe) {
-            // Find nearest wire or node, determine its net number
-            float wireHitR = 10.0f / zoom_;
-            int nearWireFrom = -1, nearWireFromPin = -1;
-            float bestD = wireHitR;
-            for (const auto& wire : sch.wires()) {
-                const SchematicComp* ca = sch.findComp(wire.fromCompId);
-                const SchematicComp* cb = sch.findComp(wire.toCompId);
-                if (!ca || !cb) continue;
-                std::vector<ImVec2> path;
-                path.push_back(pinCanvasPos(*ca, wire.fromPinIdx));
-                for (const auto& wp : wire.waypoints) path.push_back(wp);
-                path.push_back(pinCanvasPos(*cb, wire.toPinIdx));
-                for (size_t i=1;i<path.size();++i) {
-                    float d = distPointToSegment(mousePt, path[i-1], path[i]);
-                    if (d < bestD) {
-                        bestD = d;
-                        nearWireFrom    = wire.fromCompId;
-                        nearWireFromPin = wire.fromPinIdx;
+    // ── V-probe drag: update hover node B every frame ─────────────────────
+    // Searches both wire segments AND component pins so clicking directly on a
+    // component pin (e.g. inductor terminal) is reliably detected.
+    if (vProbeDragActive_) {
+        auto nodeMap = sch.computePinNodeMap();
+        float wireHitR = 14.0f / zoom_;
+        float pinHitR  = 12.0f / zoom_;
+        int nearNode = -1;
+        ImVec2 nearCanvas = mousePt;
+        float bestD = wireHitR;
+        // Wire segments
+        for (const auto& wire : sch.wires()) {
+            const SchematicComp* ca = sch.findComp(wire.fromCompId);
+            const SchematicComp* cb = sch.findComp(wire.toCompId);
+            if (!ca || !cb) continue;
+            std::vector<ImVec2> path;
+            path.push_back(pinCanvasPos(*ca, wire.fromPinIdx));
+            for (const auto& wp : wire.waypoints) path.push_back(wp);
+            path.push_back(pinCanvasPos(*cb, wire.toPinIdx));
+            for (size_t i = 1; i < path.size(); ++i) {
+                float d = distPointToSegment(mousePt, path[i-1], path[i]);
+                if (d < bestD) {
+                    bestD = d;
+                    auto it = nodeMap.find(SchematicModel::pinKey(wire.fromCompId, wire.fromPinIdx));
+                    if (it != nodeMap.end() && it->second != 0) {
+                        nearNode = it->second;
+                        nearCanvas = mousePt;
                     }
                 }
             }
-            if (nearWireFrom >= 0) {
-                auto nodeMap = sch.computePinNodeMap();
-                auto it = nodeMap.find(SchematicModel::pinKey(nearWireFrom, nearWireFromPin));
-                if (it != nodeMap.end() && it->second != 0) {
-                    char sigName[32];
-                    std::snprintf(sigName, sizeof(sigName), "V(%d)", it->second);
-                    // Check signal exists
-                    for (const auto& si : vm.availableSignals()) {
-                        if (si.name == sigName) {
-                            scope.addSignalToPlot(selPlot, si.name, 0);
-                            break;
-                        }
-                    }
-                }
-            }
-        } else if (probeMode_ == PM_IProbe) {
-            // Find nearest pin
-            float hitR2 = (12.0f / zoom_) * (12.0f / zoom_);
+        }
+        // Component pins (fallback if no wire was close enough)
+        if (nearNode == -1) {
+            float bestPinD = pinHitR;
             for (const auto& comp : sch.comps()) {
                 const CompTypeDef* td = SchematicModel::findCompType(comp.typeId);
                 if (!td) continue;
-                for (int pi=0; pi<(int)td->pins.size(); ++pi) {
+                for (int pi = 0; pi < (int)td->pins.size(); ++pi) {
                     ImVec2 pPos = pinCanvasPos(comp, pi);
-                    float dx=mousePt.x-pPos.x, dy=mousePt.y-pPos.y;
-                    if (dx*dx+dy*dy <= hitR2) {
-                        char sigName[64];
-                        std::snprintf(sigName, sizeof(sigName), "I(%s)", comp.instanceName.c_str());
-                        for (const auto& si : vm.availableSignals()) {
-                            if (si.name == sigName) {
-                                scope.addSignalToPlot(selPlot, si.name, 0);
-                                break;
-                            }
+                    float dx = mousePt.x - pPos.x, dy = mousePt.y - pPos.y;
+                    float d = std::sqrt(dx*dx + dy*dy);
+                    if (d < bestPinD) {
+                        bestPinD = d;
+                        auto it = nodeMap.find(SchematicModel::pinKey(comp.id, pi));
+                        if (it != nodeMap.end() && it->second != 0) {
+                            nearNode = it->second;
+                            nearCanvas = pPos;
                         }
-                        goto probeHandled;
                     }
                 }
             }
-            probeHandled:;
         }
+        vProbeNodeB_ = nearNode;
+        vProbeCanvasB_ = nearCanvas;
+    }
+
+    // ── V-probe drag: release → add signal ────────────────────────────────
+    if (vProbeDragActive_ && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+        if (vm.scopeCount() == 0) { int ni = vm.addScope(); vm.setActiveScope(ni); }
+        vm.syncRawCacheToScope(vm.activeScope());
+        ScopeModel& scope = vm.scope(vm.activeScope());
+        int selPlot = scope.selectedPlot();
+        // Resolve net names for probe nodes (prefer user-assigned net name over numeric ID)
+        std::string netNameA = sch.getNetNameForNode(vProbeNodeA_);
+        std::string sigA = netNameA.empty()
+            ? ("V(" + std::to_string(vProbeNodeA_) + ")")
+            : ("V(" + netNameA + ")");
+        // Rename numeric-ID signal → named signal if applicable
+        if (!netNameA.empty())
+            vm.renameSignal("V(" + std::to_string(vProbeNodeA_) + ")", sigA);
+
+        int activeSchId = vm.activeSchDoc().id;
+        if (vProbeNodeB_ == -1 || vProbeNodeB_ == vProbeNodeA_) {
+            // Add directly without gating on availableSignals(): the user may
+            // probe before Build & Run, in which case probes_ is still empty
+            // but the entry must exist so dispatchSample fills it once the
+            // simulation starts.
+            scope.addSignalToPlot(selPlot, sigA, 0, activeSchId);
+        } else {
+            std::string netNameB = sch.getNetNameForNode(vProbeNodeB_);
+            std::string sigB = netNameB.empty()
+                ? ("V(" + std::to_string(vProbeNodeB_) + ")")
+                : ("V(" + netNameB + ")");
+            if (!netNameB.empty())
+                vm.renameSignal("V(" + std::to_string(vProbeNodeB_) + ")", sigB);
+            std::string label = sigA + "-" + sigB.substr(2, sigB.size() - 3); // V(A-B)
+            label = "V(" + sigA.substr(2, sigA.size()-3) + "-" + sigB.substr(2, sigB.size()-3) + ")";
+            vm.registerComputedSig(label, sigA, 1.0, sigB, -1.0);
+            scope.addSignalToPlot(selPlot, label, 0, activeSchId);
+            vm.retroComputeSig(label);
+        }
+        vProbeDragActive_ = false;
+        vProbeNodeA_ = vProbeNodeB_ = -1;
+        probeMode_ = PM_None;
+    }
+
+    // ── Probe mode: V-probe press (start drag) / I-probe click ────────────
+    if (hovered && probeMode_ == PM_VProbe && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        auto nodeMap = sch.computePinNodeMap();
+        float wireHitR = 12.0f / zoom_;
+        int foundNode = -1;
+        ImVec2 foundCanvas = mousePt;
+        float bestD = wireHitR;
+        // Search wire segments first
+        for (const auto& wire : sch.wires()) {
+            const SchematicComp* ca = sch.findComp(wire.fromCompId);
+            const SchematicComp* cb = sch.findComp(wire.toCompId);
+            if (!ca || !cb) continue;
+            std::vector<ImVec2> path;
+            path.push_back(pinCanvasPos(*ca, wire.fromPinIdx));
+            for (const auto& wp : wire.waypoints) path.push_back(wp);
+            path.push_back(pinCanvasPos(*cb, wire.toPinIdx));
+            for (size_t i = 1; i < path.size(); ++i) {
+                float d = distPointToSegment(mousePt, path[i-1], path[i]);
+                if (d < bestD) {
+                    bestD = d;
+                    auto it = nodeMap.find(SchematicModel::pinKey(wire.fromCompId, wire.fromPinIdx));
+                    if (it != nodeMap.end() && it->second != 0) { foundNode = it->second; foundCanvas = mousePt; }
+                }
+            }
+        }
+        // Also search component pins if no wire found
+        if (foundNode == -1) {
+            float pinHitR = 12.0f / zoom_, bestPD = pinHitR;
+            for (const auto& comp : sch.comps()) {
+                const CompTypeDef* td = SchematicModel::findCompType(comp.typeId);
+                if (!td) continue;
+                for (int pi = 0; pi < (int)td->pins.size(); ++pi) {
+                    ImVec2 pPos = pinCanvasPos(comp, pi);
+                    float dx = mousePt.x - pPos.x, dy = mousePt.y - pPos.y;
+                    float d = std::sqrt(dx*dx + dy*dy);
+                    if (d < bestPD) {
+                        bestPD = d;
+                        auto it = nodeMap.find(SchematicModel::pinKey(comp.id, pi));
+                        if (it != nodeMap.end() && it->second != 0) { foundNode = it->second; foundCanvas = pPos; }
+                    }
+                }
+            }
+        }
+        if (foundNode != -1) {
+            vProbeDragActive_ = true;
+            vProbeNodeA_ = foundNode;
+            vProbeCanvasA_ = foundCanvas;
+            vProbeNodeB_ = -1;
+        }
+    } else if (hovered && probeMode_ == PM_IProbe && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        if (vm.scopeCount() == 0) { int ni = vm.addScope(); vm.setActiveScope(ni); }
+        vm.syncRawCacheToScope(vm.activeScope());
+        ScopeModel& scope = vm.scope(vm.activeScope());
+        int selPlot = scope.selectedPlot();
+        float hitR2 = (12.0f / zoom_) * (12.0f / zoom_);
+        for (const auto& comp : sch.comps()) {
+            const CompTypeDef* td = SchematicModel::findCompType(comp.typeId);
+            if (!td) continue;
+            for (int pi = 0; pi < (int)td->pins.size(); ++pi) {
+                ImVec2 pPos = pinCanvasPos(comp, pi);
+                float dx = mousePt.x - pPos.x, dy = mousePt.y - pPos.y;
+                if (dx*dx + dy*dy <= hitR2) {
+                    std::string iSig, iLabel;
+                    double iScale = 1.0;
+                    bool probeReady = false;
+
+                    if (comp.typeId == "TX_WIND") {
+                        // Find TX_CORE parent and sorted winding index
+                        if (!comp.paramValues.empty()) {
+                            const std::string& grp = comp.paramValues[0];
+                            const SchematicComp* txCore = nullptr;
+                            for (const auto& tc : sch.comps())
+                                if (tc.typeId == "TX_CORE" && !tc.paramValues.empty() && tc.paramValues[0] == grp)
+                                    { txCore = &tc; break; }
+                            if (txCore) {
+                                std::vector<const SchematicComp*> winds;
+                                for (const auto& wc : sch.comps())
+                                    if (wc.typeId == "TX_WIND" && !wc.paramValues.empty() && wc.paramValues[0] == grp)
+                                        winds.push_back(&wc);
+                                std::sort(winds.begin(), winds.end(), [](const SchematicComp* a, const SchematicComp* b){
+                                    int ai=0, bi=0;
+                                    try { if (a->paramValues.size()>1) ai=std::stoi(a->paramValues[1]); } catch(...){}
+                                    try { if (b->paramValues.size()>1) bi=std::stoi(b->paramValues[1]); } catch(...){}
+                                    return ai < bi;
+                                });
+                                int wi = -1;
+                                for (int i = 0; i < (int)winds.size(); ++i)
+                                    if (winds[i]->id == comp.id) { wi = i; break; }
+                                if (wi >= 0) {
+                                    std::string wSuffix = wi > 0 ? "_W" + std::to_string(wi) : "";
+                                    iSig   = "I(" + txCore->instanceName + wSuffix + ")";
+                                    const std::string& pinLbl = td->pins[pi].label;
+                                    iLabel = "I(" + txCore->instanceName + wSuffix + "-" + pinLbl + ")";
+                                    iScale = (pi == 0) ? 1.0 : -1.0;
+                                    // Don't gate on availableSignals(): user may probe before
+                                    // Build & Run; the entry must exist so dispatchSample fills
+                                    // it once the simulation starts.
+                                    probeReady = true;
+                                }
+                            }
+                        }
+                    } else if (comp.typeId == "TX" || comp.typeId == "TX3") {
+                        int wi = pi / 2;
+                        iScale = (pi % 2 == 0) ? 1.0 : -1.0;
+                        std::string wSuffix = wi > 0 ? "_W" + std::to_string(wi) : "";
+                        iSig   = "I(" + comp.instanceName + wSuffix + ")";
+                        const std::string& pinLbl = td->pins[pi].label;
+                        iLabel = "I(" + comp.instanceName + wSuffix + "-" + pinLbl + ")";
+                        probeReady = true;
+                    } else {
+                        iSig   = "I(" + comp.instanceName + ")";
+                        const std::string& pinLbl = td->pins[pi].label;
+                        iLabel = "I(" + comp.instanceName + "-" + pinLbl + ")";
+                        iScale = (pi == 0) ? 1.0 : -1.0;
+                        probeReady = true;
+                    }
+
+                    if (probeReady) {
+                        vm.registerComputedSig(iLabel, iSig, iScale);
+                        scope.addSignalToPlot(selPlot, iLabel, 0, vm.activeSchDoc().id);
+                        vm.retroComputeSig(iLabel);
+                    }
+                    goto probeHandled;
+                }
+            }
+        }
+        probeHandled:;
         probeMode_ = PM_None;
     }
 
     // ── Left-click ────────────────────────────────────────────────────────
-    if (hovered && probeMode_ == PM_None && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+    else if (hovered && probeMode_ == PM_None && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         bool hitPin = false, hitBody = false;
 
         // Priority 1: pins (use rotated positions)
@@ -500,8 +1147,10 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
                 float dx = mousePt.x - pPos.x, dy = mousePt.y - pPos.y;
                 if (dx*dx + dy*dy <= hitR*hitR) {
                     if (wiringActive_) {
-                        if (comp.id != wireFromCompId_ || pi != wireFromPinIdx_)
+                        if (comp.id != wireFromCompId_ || pi != wireFromPinIdx_) {
+                            pushUndo(undoStack_, redoStack_, sch, kMaxUndo);
                             sch.addWire(wireFromCompId_, wireFromPinIdx_, comp.id, pi, wireWaypoints_);
+                        }
                         wiringActive_ = false; wireFromCompId_ = -1; wireWaypoints_.clear();
                     } else {
                         wiringActive_   = true;
@@ -554,6 +1203,7 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
                 if (hitWireId >= 0) break;
             }
             if (hitWireId >= 0) {
+                pushUndo(undoStack_, redoStack_, sch, kMaxUndo);
                 int juncId = insertJunctionOnWire(sch, hitWireId, hitWireSnap);
                 if (juncId >= 0) {
                     sch.addWire(wireFromCompId_, wireFromPinIdx_, juncId, 0, wireWaypoints_);
@@ -578,7 +1228,10 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
                     wireWaypoints_.clear();
 
                     if (ImGui::GetIO().KeyCtrl) {
-                        // Ctrl+click: toggle in multi-select without starting move
+                        // Ctrl+click: toggle in multi-select without starting move.
+                        // On first Ctrl+click, also include the previously single-selected comp.
+                        if (selectedCompId_ != -1 && multiSelectedIds_.empty())
+                            multiSelectedIds_.push_back(selectedCompId_);
                         auto it = std::find(multiSelectedIds_.begin(), multiSelectedIds_.end(), comp.id);
                         if (it != multiSelectedIds_.end()) {
                             multiSelectedIds_.erase(it);
@@ -602,12 +1255,23 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
                         movingCompId_    = comp.id;
                         moveStartCanvas_ = mousePt;
                         moveCompOrigPos_ = comp.pos;
+                        pushUndo(undoStack_, redoStack_, sch, kMaxUndo);
                         // Store original positions of all selected for multi-move
                         multiMoveOrigPos_.clear();
                         auto& toMove = inMulti ? multiSelectedIds_ : std::vector<int>{comp.id};
                         for (int cid : toMove) {
                             SchematicComp* mc = sch.findComp(cid);
                             if (mc) multiMoveOrigPos_.push_back({cid, mc->pos});
+                        }
+                        // Store original waypoints for wires fully inside the moved set
+                        moveWaypointOrig_.clear();
+                        std::unordered_set<int> movedSet;
+                        for (auto& [cid, origP] : multiMoveOrigPos_) movedSet.insert(cid);
+                        for (auto& w : sch.wires()) {
+                            if (!w.waypoints.empty()
+                                && movedSet.count(w.fromCompId)
+                                && movedSet.count(w.toCompId))
+                                moveWaypointOrig_.push_back({w.id, w.waypoints});
                         }
                         // Refresh property buffers
                         if (propEditCompId_ != comp.id) {
@@ -656,9 +1320,30 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
                 if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
                     editNetWireId_ = bestWireId;
                     SchematicWire* ew = sch.findWire(bestWireId);
-                    strncpy(editNetNameBuf_, ew ? ew->netName.c_str() : "",
-                            sizeof(editNetNameBuf_)-1);
-                    editNetNameBuf_[sizeof(editNetNameBuf_)-1] = '\0';
+                    if (ew) {
+                        strncpy(editNetNameBuf_, ew->netName.c_str(), sizeof(editNetNameBuf_)-1);
+                        editNetNameBuf_[sizeof(editNetNameBuf_)-1] = '\0';
+                        // If wire has no name, check for NETLABEL on the same net
+                        if (editNetNameBuf_[0] == '\0') {
+                            auto nodeMap = sch.computePinNodeMap();
+                            auto nit = nodeMap.find(SchematicModel::pinKey(ew->fromCompId, ew->fromPinIdx));
+                            if (nit != nodeMap.end() && nit->second != 0) {
+                                int nodeId = nit->second;
+                                for (const auto& c : sch.comps())
+                                    if (c.typeId == "NETLABEL" && !c.paramValues.empty()) {
+                                        auto cit = nodeMap.find(SchematicModel::pinKey(c.id, 0));
+                                        if (cit != nodeMap.end() && cit->second == nodeId) {
+                                            strncpy(editNetNameBuf_, c.paramValues[0].c_str(),
+                                                    sizeof(editNetNameBuf_)-1);
+                                            editNetNameBuf_[sizeof(editNetNameBuf_)-1] = '\0';
+                                            break;
+                                        }
+                                    }
+                            }
+                        }
+                    } else {
+                        editNetNameBuf_[0] = '\0';
+                    }
                 }
             } else {
                 // Start rubber-band selection box
@@ -719,25 +1404,39 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
                 SchematicComp* c = sch.findComp(movingCompId_);
                 if (c) c->pos = snapGrid({moveCompOrigPos_.x + dx, moveCompOrigPos_.y + dy});
             }
+            // Move waypoints for wires fully within the moved set
+            float snappedDx = snapGrid({dx, 0}).x;
+            float snappedDy = snapGrid({0, dy}).y;
+            for (auto& [wid, origWps] : moveWaypointOrig_) {
+                SchematicWire* w = sch.findWire(wid);
+                if (!w) continue;
+                w->waypoints.resize(origWps.size());
+                for (size_t i = 0; i < origWps.size(); i++)
+                    w->waypoints[i] = {origWps[i].x + snappedDx, origWps[i].y + snappedDy};
+            }
         } else {
             movingCompId_ = -1;
             multiMoveOrigPos_.clear();
+            moveWaypointOrig_.clear();
         }
     }
 
     // ── Delete ─────────────────────────────────────────────────────────────
     if (ImGui::IsKeyPressed(ImGuiKey_Delete)) {
         if (!multiSelectedIds_.empty()) {
+            pushUndo(undoStack_, redoStack_, sch, kMaxUndo);
             for (int cid : multiSelectedIds_) sch.removeComp(cid);
             multiSelectedIds_.clear();
             selectedCompId_ = propEditCompId_ = movingCompId_ = -1;
             multiMoveOrigPos_.clear();
             wiringActive_ = false;
         } else if (selectedCompId_ != -1) {
+            pushUndo(undoStack_, redoStack_, sch, kMaxUndo);
             sch.removeComp(selectedCompId_);
             selectedCompId_ = propEditCompId_ = movingCompId_ = -1;
             wiringActive_ = false;
         } else if (selectedWireId_ != -1) {
+            pushUndo(undoStack_, redoStack_, sch, kMaxUndo);
             sch.removeWire(selectedWireId_);
             selectedWireId_ = -1;
         }
@@ -763,13 +1462,28 @@ void SchematicView::drawWires(ImDrawList* dl, MainViewModel& vm, ImVec2 origin) 
     const SchematicModel& sch = vm.schematic();
     const ImU32 wireCol = IM_COL32(200, 200, 80, 220);
 
-    // Determine which net to highlight (from scope legend hover)
+    // Determine which nets to highlight (from scope legend hover).
+    // Supports both numeric V(N), named V(VIN), and differential V(A-B).
     const std::string& hovSig = vm.hoveredSignal();
-    int hovNet = -1;
+    int hovNetA = -1, hovNetB = -1;
     std::unordered_map<int,int> nodeMap;
     if (hovSig.size() > 2 && hovSig[0]=='V' && hovSig[1]=='(') {
-        try { hovNet = std::stoi(hovSig.substr(2, hovSig.size()-3)); } catch(...) {}
-        if (hovNet >= 0) nodeMap = sch.computePinNodeMap();
+        std::string inner = hovSig.substr(2, hovSig.size() - 3);  // strip "V(" and ")"
+        size_t dash = inner.find('-');
+        auto resolveNet = [&](const std::string& s) -> int {
+            try { return std::stoi(s); } catch(...) {}
+            // Named net: look up in netName→nodeId map
+            auto netNameMap = sch.computeNetNameToNodeMap();
+            auto it = netNameMap.find(s);
+            return (it != netNameMap.end()) ? it->second : -1;
+        };
+        if (dash == std::string::npos) {
+            hovNetA = resolveNet(inner);
+        } else {
+            hovNetA = resolveNet(inner.substr(0, dash));
+            hovNetB = resolveNet(inner.substr(dash + 1));
+        }
+        if (hovNetA >= 0) nodeMap = sch.computePinNodeMap();
     }
 
     for (const auto& wire : sch.wires()) {
@@ -778,16 +1492,20 @@ void SchematicView::drawWires(ImDrawList* dl, MainViewModel& vm, ImVec2 origin) 
         if (!ca || !cb) continue;
         bool wireSel = (wire.id == selectedWireId_);
 
-        // Highlight if wire is in the hovered net
-        bool wireHighlight = false;
-        if (hovNet >= 0 && !nodeMap.empty()) {
+        // Highlight positive net (gold) and negative net (green) independently
+        int wireNet = -1;
+        if (hovNetA >= 0 && !nodeMap.empty()) {
             auto it = nodeMap.find(SchematicModel::pinKey(wire.fromCompId, wire.fromPinIdx));
-            wireHighlight = (it != nodeMap.end() && it->second == hovNet);
+            if (it != nodeMap.end()) wireNet = it->second;
         }
+        bool hlA = (wireNet >= 0 && wireNet == hovNetA);
+        bool hlB = (wireNet >= 0 && wireNet == hovNetB);
 
-        ImU32 col = wireSel        ? IM_COL32(255, 255, 100, 255) :
-                    wireHighlight  ? IM_COL32(255, 160,  50, 255) : wireCol;
-        float thick = (wireSel || wireHighlight) ? 3.0f * zoom_ : 1.5f * zoom_;
+        ImU32 col = wireSel ? IM_COL32(255, 255, 100, 255) :
+                    hlA     ? IM_COL32(255, 220,  50, 255) :   // positive net: gold
+                    hlB     ? IM_COL32( 80, 255, 120, 255) :   // negative net: green
+                              wireCol;
+        float thick = (wireSel || hlA || hlB) ? 3.0f * zoom_ : 1.5f * zoom_;
 
         ImVec2 prevScr = c2s(pinCanvasPos(*ca, wire.fromPinIdx), origin);
         for (const auto& wp : wire.waypoints) {
@@ -919,8 +1637,8 @@ void SchematicView::drawCompSymbol(ImDrawList* dl, const SchematicComp& comp,
     }
     // ── Capacitor ─────────────────────────────────────────────────────────
     else if (id == "C") {
-        dl->AddLine(sc(-40,0), sc(-5,0),  col, thick);
-        dl->AddLine(sc(+5,0),  sc(+40,0), col, thick);
+        dl->AddLine(sc(-20,0), sc(-5,0),  col, thick);
+        dl->AddLine(sc(+5,0),  sc(+20,0), col, thick);
         dl->AddLine(sc(-5,-12), sc(-5,+12), col, thick*1.5f);
         dl->AddLine(sc(+5,-12), sc(+5,+12), col, thick*1.5f);
     }
@@ -980,10 +1698,8 @@ void SchematicView::drawCompSymbol(ImDrawList* dl, const SchematicComp& comp,
         dl->AddCircle(ctr, 18.f*z, col, 32, thick);
         dl->AddLine(sc(-40,0), sc(-18,0), col, thick);
         dl->AddLine(sc(+18,0), sc(+40,0), col, thick);
-        dl->AddLine({ctr.x + 8*z, ctr.y}, {ctr.x - 8*z, ctr.y}, col, thick);
-        dl->AddTriangleFilled({ctr.x - 8*z, ctr.y},
-                              {ctr.x - 4*z, ctr.y - 4*z},
-                              {ctr.x - 4*z, ctr.y + 4*z}, col);
+        dl->AddLine(sc(+8,0), sc(-8,0), col, thick);
+        dl->AddTriangleFilled(sc(-8,0), sc(-4,-4), sc(-4,+4), col);
     }
     // ── Diode ─────────────────────────────────────────────────────────────
     else if (id == "D") {
@@ -1211,6 +1927,34 @@ void SchematicView::drawCompSymbol(ImDrawList* dl, const SchematicComp& comp,
 void SchematicView::drawComponents(ImDrawList* dl, MainViewModel& vm, ImVec2 origin) {
     const SchematicModel& sch = vm.schematic();
 
+    // Pre-compute the I-hover target instance name once.
+    // The hovered signal can take several forms:
+    //   "I(R1)"            — auto-populated probe, simple component
+    //   "I(R1-P)"          — interactively probed, with pin-label suffix
+    //   "I(TX1_W1)"        — TX winding (auto-populated)
+    //   "I(TX1_W1-P)"      — interactively probed TX winding pin
+    // Strip the leading "I(" and trailing ")", then drop any "-<pinLabel>"
+    // suffix and any "_W<digits>" winding-index suffix to recover the bare
+    // SchematicComp::instanceName ("R1" / "TX1" in the examples above).
+    std::string hovICompName;
+    {
+        const std::string& hovSig = vm.hoveredSignal();
+        if (hovSig.size() > 3 && hovSig[0] == 'I' && hovSig[1] == '('
+            && hovSig.back() == ')') {
+            std::string s = hovSig.substr(2, hovSig.size() - 3);
+            size_t dash = s.find('-');
+            if (dash != std::string::npos) s = s.substr(0, dash);
+            size_t wpos = s.rfind("_W");
+            if (wpos != std::string::npos && wpos + 2 < s.size()) {
+                bool allDigits = true;
+                for (size_t i = wpos + 2; i < s.size(); i++)
+                    if (!std::isdigit((unsigned char)s[i])) { allDigits = false; break; }
+                if (allDigits) s = s.substr(0, wpos);
+            }
+            hovICompName = std::move(s);
+        }
+    }
+
     for (const auto& comp : sch.comps()) {
         const CompTypeDef* td = SchematicModel::findCompType(comp.typeId);
         if (!td) continue;
@@ -1218,12 +1962,9 @@ void SchematicView::drawComponents(ImDrawList* dl, MainViewModel& vm, ImVec2 ori
                    (!multiSelectedIds_.empty() &&
                     std::find(multiSelectedIds_.begin(), multiSelectedIds_.end(), comp.id)
                         != multiSelectedIds_.end());
-        // Highlight component if scope legend hovers its current signal
-        const std::string& hovSig = vm.hoveredSignal();
-        if (!hovSig.empty() && hovSig.size()>2 && hovSig[0]=='I' && hovSig[1]=='(') {
-            std::string hovComp = hovSig.substr(2, hovSig.size()-3);
-            if (comp.instanceName == hovComp) sel = true;
-        }
+        // Highlight component if scope legend hovers its current signal.
+        if (!hovICompName.empty() && comp.instanceName == hovICompName)
+            sel = true;
         ImVec2 ctr = c2s(comp.pos, origin);
 
         // ── GND symbol ────────────────────────────────────────────────────
@@ -1381,19 +2122,25 @@ void SchematicView::renderProperties(MainViewModel& vm) {
 
     ImGui::SetNextItemWidth(100.0f);
     ImGui::InputText("Name##prop", propNameBuf_, sizeof(propNameBuf_));
-    if (ImGui::IsItemDeactivatedAfterEdit()) c->instanceName = propNameBuf_;
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+        pushUndo(undoStack_, redoStack_, sch, kMaxUndo);
+        c->instanceName = propNameBuf_;
+    }
 
     for (int i = 0; i < (int)td->params.size() && i < 8; ++i) {
         ImGui::SameLine();
         ImGui::SetNextItemWidth(120.0f);
         ImGui::InputText(td->params[i].name.c_str(), propBufs_[i], sizeof(propBufs_[i]));
-        if (ImGui::IsItemDeactivatedAfterEdit() && i < (int)c->paramValues.size())
+        if (ImGui::IsItemDeactivatedAfterEdit() && i < (int)c->paramValues.size()) {
+            pushUndo(undoStack_, redoStack_, sch, kMaxUndo);
             c->paramValues[i] = propBufs_[i];
+        }
     }
 
     // Rotate button in the property panel as well
     ImGui::SameLine();
     if (ImGui::Button("Rotate 90°")) {
+        pushUndo(undoStack_, redoStack_, sch, kMaxUndo);
         c->rotation = (c->rotation + 1) % 4;
         propEditCompId_ = -1;  // force buffer refresh next frame
     }

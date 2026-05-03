@@ -1,14 +1,27 @@
 #pragma once
 #include "views/base_view.h"
+#include "view_model/schematic_model.h"
 #include <imgui.h>
 #include <string>
 #include <vector>
 #include <utility>
+#include <deque>
+#include <algorithm>
 
 class SchematicView : public BaseView {
 public:
     SchematicView();
     void render(MainViewModel& vm) override;
+    void addScopeView(class ScopeView* sv) { scopeViews_.push_back(sv); }
+    void removeScopeView(class ScopeView* sv) {
+        scopeViews_.erase(std::remove(scopeViews_.begin(), scopeViews_.end(), sv), scopeViews_.end());
+    }
+    void performAutoSave(MainViewModel& vm);
+
+    // Set when the user closes a doc tab. MainView::render consumes this so it
+    // can tear down the doc's ScopeViews + sim state in lockstep before calling
+    // closeSchDoc on the model.
+    int  takePendingCloseDoc() { int v = pendingCloseDocIdx_; pendingCloseDocIdx_ = -1; return v; }
 
 private:
     // ── Canvas pan / zoom ───────────────────────────────────────────────────
@@ -27,6 +40,7 @@ private:
     bool   selBoxActive_      = false;
     ImVec2 selBoxStartCanvas_ = {0, 0};
     std::vector<std::pair<int,ImVec2>> multiMoveOrigPos_; // compId → original pos for multi-move
+    std::vector<std::pair<int,std::vector<ImVec2>>> moveWaypointOrig_; // wireId → original waypoints
 
     // ── Wire drawing ────────────────────────────────────────────────────────
     bool wiringActive_   = false;
@@ -45,6 +59,21 @@ private:
     // ── Save / Load status ───────────────────────────────────────────────────
     char  ioStatus_[64] = {};
     float ioStatusTimer_ = 0.f;
+    // Active doc's filePath, synced from MainViewModel each frame so existing
+    // code (toolbar, status overlay, Ctrl+S handler) keeps working unchanged.
+    std::string savedFilePath_;
+    std::vector<class ScopeView*> scopeViews_;  // registered by MainView
+
+    bool pendingAutoLoad_ = true;  // try to restore last session on first render
+    int  pendingCloseDocIdx_ = -1; // doc index whose tab the user just closed
+
+    // doSave/doLoad take an explicit doc index so multi-doc save/load is
+    // unambiguous. -1 = active doc.
+    // includeScopeState=false suppresses XSCOPE_N + per-scope blocks; kept as an
+    // escape hatch for circuit-only exports.
+    void doSave(const std::string& path, MainViewModel& vm, bool silent = false,
+                int docIdx = -1, bool includeScopeState = true);
+    void doLoad(const std::string& path, MainViewModel& vm);
 
     // ── Wire net name editing ────────────────────────────────────────────────
     int  editNetWireId_  = -1;
@@ -53,6 +82,18 @@ private:
     // ── Probe mode ───────────────────────────────────────────────────────────
     enum ProbeMode { PM_None, PM_VProbe, PM_IProbe };
     ProbeMode probeMode_ = PM_None;
+
+    // ── V-probe drag state ────────────────────────────────────────────────────
+    bool    vProbeDragActive_ = false;
+    int     vProbeNodeA_      = -1;
+    ImVec2  vProbeCanvasA_    = {0, 0};
+    int     vProbeNodeB_      = -1;
+    ImVec2  vProbeCanvasB_    = {0, 0};
+
+    // ── Undo / Redo ───────────────────────────────────────────────────────────
+    static constexpr int kMaxUndo = 50;
+    std::deque<SchematicModel> undoStack_;
+    std::deque<SchematicModel> redoStack_;
 
     // ── Custom transformer wizard ─────────────────────────────────────────────
     bool   txNPending_    = false;

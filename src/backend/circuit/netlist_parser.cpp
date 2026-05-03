@@ -103,13 +103,25 @@ bool NetlistParser::parseProbe(const std::string& token, ParseResult& result) {
         si.index = std::stoi(arg);
     } else if (type == 'I') {
         si.type = SignalInfo::BranchCurrent;
-        // Find component by name
-        const BaseComponent* comp = result.circuit.findComponent(arg);
+        // Strip optional per-winding suffix _Wk (e.g. "TX1_W1" → compName="TX1", windingIdx=1)
+        int windingIdx = 0;
+        std::string compName = arg;
+        size_t wPos = arg.rfind("_W");
+        if (wPos != std::string::npos && wPos + 2 < arg.size()) {
+            bool allDigit = true;
+            for (size_t i = wPos + 2; i < arg.size(); ++i)
+                if (!std::isdigit((unsigned char)arg[i])) { allDigit = false; break; }
+            if (allDigit) {
+                windingIdx = std::stoi(arg.substr(wPos + 2));
+                compName   = arg.substr(0, wPos);
+            }
+        }
+        const BaseComponent* comp = result.circuit.findComponent(compName);
         if (!comp) {
-            result.error = "PROBE: unknown component " + arg;
+            result.error = "PROBE: unknown component " + compName;
             return false;
         }
-        si.index = 0; // will be resolved by simulator
+        si.index = windingIdx; // winding offset (0 = primary, 1..N-1 = secondaries)
         si.name = "I(" + arg + ")";
     } else {
         result.error = "Unknown probe type: " + token;

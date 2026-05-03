@@ -17,8 +17,15 @@ public:
     double getBranchCurrent(const Eigen::VectorXd& x, size_t) const override {
         double va = (na_ > 0) ? x(na_ - 1) : 0.0;
         double vk = (nk_ > 0) ? x(nk_ - 1) : 0.0;
-        double r = isOn_ ? R_ON : R_OFF;
-        return (va - vk) / r;
+        double vak = va - vk;
+        if (isOn_) {
+            // ON: current = Vak / R_ON. Clamp to 0 to report no reverse current
+            // (transient solver may leave Vak slightly negative before next iteration flips state)
+            double i = vak / R_ON;
+            return (i > 0.0) ? i : 0.0;
+        }
+        // OFF: only tiny leakage; clamp to 0 for clean reporting
+        return 0.0;
     }
 
     bool updateState(const Eigen::VectorXd& x, size_t) override {
@@ -27,26 +34,45 @@ public:
         double vak = va - vk;
 
         bool changed = false;
-        if (isOn_ && vak < -V_THRESHOLD) {
-            isOn_ = false;
-            changed = true;
-        } else if (!isOn_ && vak > V_THRESHOLD) {
-            isOn_ = true;
-            changed = true;
+        if (isOn_) {
+            // Turn OFF as soon as Vak < 0: ideal diode carries no reverse current.
+            if (vak < 0.0) {
+                isOn_         = false;
+                changed       = true;
+                justFlippedOff_ = true;  // block re-turn-on this innerSolve (anti-chatter)
+            }
+        } else if (!justFlippedOff_) {
+            // Turn ON only when clearly forward biased AND we haven't just flipped OFF
+            // in this same inner-solve pass (prevents ON↔OFF chattering at zero crossing).
+            if (vak > V_ON) {
+                isOn_   = true;
+                changed = true;
+            }
         }
         return changed;
     }
 
-    void saveState() override    { savedIsOn_ = isOn_; }
-    void restoreState() override { isOn_ = savedIsOn_; }
+    // saveState / restoreState called by the simulator around each innerSolve call.
+    // Both reset justFlippedOff_ so every new solve pass starts fresh.
+    void saveState() override {
+        savedIsOn_      = isOn_;
+        justFlippedOff_ = false;
+    }
+    void restoreState() override {
+        isOn_           = savedIsOn_;
+        justFlippedOff_ = false;
+    }
+
     bool stateChangedSinceLastSave() const override { return isOn_ != savedIsOn_; }
 
 private:
     std::string name_;
-    int na_, nk_;
-    bool isOn_;
-    bool savedIsOn_ = false;
-    static constexpr double R_ON  = 1e-3;
-    static constexpr double R_OFF = 1e9;
-    static constexpr double V_THRESHOLD = 1e-6;
+    int  na_, nk_;
+    bool isOn_          = false;
+    bool savedIsOn_     = false;
+    bool justFlippedOff_ = false;   // per-innerSolve anti-chatter flag
+
+    static constexpr double R_ON  = 1e-3;   // on-state resistance (1 mΩ)
+    static constexpr double R_OFF = 1e9;    // off-state resistance (1 GΩ)
+    static constexpr double V_ON  = 1e-3;   // turn-on threshold: Vak > 1 mV
 };

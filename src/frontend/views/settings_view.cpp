@@ -1,8 +1,7 @@
 #include "views/settings_view.h"
 #include "view_model/main_view_model.h"
-#include "platform/file_dialog.h"
 #include <imgui.h>
-#include <cstring>
+#include <string>
 
 SettingsView::SettingsView() : BaseView("Simulation Settings") {}
 
@@ -13,69 +12,39 @@ void SettingsView::render(MainViewModel& vm) {
         return;
     }
 
-    // Netlist file loader
-    ImGui::Text("Netlist File:");
-    ImGui::InputText("##path", netlistPath_, sizeof(netlistPath_));
-    ImGui::SameLine();
-    if (ImGui::Button("Load")) {
-        if (vm.loadNetlist(netlistPath_)) {
-            dtInput_    = vm.simConfig().dt;
-            tEndInput_  = vm.simConfig().t_end;
+    // ── Memory budget ──────────────────────────────────────────────────────
+    // Per-sch buffers multiply memory usage by the number of open schematics,
+    // so expose the per-signal sample cap directly. 16 B/sample × N samples
+    // × M signals × K schematics ≈ total memory.
+    {
+        size_t cur = vm.maxStoredSamples();
+        int curM = (int)((cur * 16ull) / (1024ull * 1024ull));  // MB per signal
+        if (curM < 1) curM = 1;
+        ImGui::Text("Max memory per signal:");
+        ImGui::SetNextItemWidth(120.0f);
+        if (ImGui::InputInt("MB##maxmem", &curM, 1, 16)) {
+            if (curM < 1) curM = 1;
+            if (curM > 4096) curM = 4096;  // 4 GB sanity cap
+            size_t newSamples = ((size_t)curM * 1024ull * 1024ull) / 16ull;
+            vm.setMaxStoredSamples(newSamples);
         }
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Browse...")) {
-        std::string path = platform::openFileDialog();
-        if (!path.empty()) {
-            strncpy(netlistPath_, path.c_str(), sizeof(netlistPath_) - 1);
-            netlistPath_[sizeof(netlistPath_) - 1] = '\0';
-            if (vm.loadNetlist(netlistPath_)) {
-                dtInput_   = vm.simConfig().dt;
-                tEndInput_ = vm.simConfig().t_end;
-            }
-        }
-    }
-
-    ImGui::Separator();
-
-    // Simulation parameters
-    ImGui::Text("Parameters:");
-    ImGui::InputDouble("Step dt (s)", &dtInput_, 0.0, 0.0, "%.2e");
-    ImGui::InputDouble("End time (s)", &tEndInput_, 0.0, 0.0, "%.2e");
-
-    // Informational: show estimated stored sample count (always ratio=1)
-    if (dtInput_ > 0.0 && tEndInput_ > 0.0) {
-        size_t estPts = static_cast<size_t>(tEndInput_ / dtInput_) + 1;
-        if (estPts > 5000000) estPts = 5000000; // capped
-        ImGui::TextDisabled("  ~%llu pts stored (capped at 5M)", static_cast<unsigned long long>(estPts));
-    }
-
-    ImGui::Separator();
-
-    // Control buttons
-    if (vm.isSimRunning() && !vm.isSimPaused()) {
-        if (ImGui::Button("Pause")) vm.pause();
         ImGui::SameLine();
+        ImGui::TextDisabled("(= %zu samples)", vm.maxStoredSamples());
+        ImGui::TextDisabled("Multiplied by #signals × #open schematics. Applies to new buffers only.");
+        ImGui::Separator();
     }
-    if (ImGui::Button("Run")) {   // always resets to t=0 before starting
-        vm.applySimConfig(dtInput_, tEndInput_);
-        vm.play();
-    }
 
-    ImGui::Separator();
-
-    // Status
-    ImGui::Text("Status: %s", vm.statusMessage().c_str());
-    ImGui::Text("Sim time: %.6f s", vm.currentTime());
-
-    // Available signals list
-    ImGui::Separator();
+    // ── Available Signals ──────────────────────────────────────────────────
     ImGui::Text("Available Signals:");
-    for (const auto& sig : vm.availableSignals()) {
-        ImGui::BulletText("%s", sig.name.c_str());
+    const auto& sigs = vm.availableSignals();
+    if (sigs.empty()) {
+        ImGui::TextDisabled("  (none — build from schematic first)");
+    } else {
+        for (const auto& sig : sigs)
+            ImGui::BulletText("%s", sig.name.c_str());
     }
 
-    // ── Diagnostics log ────────────────────────────────────────────────────────
+    // ── Diagnostics ────────────────────────────────────────────────────────
     ImGui::Separator();
     if (ImGui::CollapsingHeader("Diagnostics", ImGuiTreeNodeFlags_DefaultOpen)) {
         const auto& log = vm.diagLog();
@@ -87,9 +56,18 @@ void SettingsView::render(MainViewModel& vm) {
             lastDiagCount_ = 0;
         }
         ImGui::SameLine();
+        if (ImGui::Button("Copy All##diag")) {
+            std::string all;
+            for (const auto& ev : log) {
+                all += ev.message;
+                all += '\n';
+            }
+            ImGui::SetClipboardText(all.c_str());
+        }
+        ImGui::SameLine();
         ImGui::TextDisabled("(%zu entries)", log.size());
 
-        ImGui::BeginChild("##diaglog", ImVec2(0.0f, 180.0f), true,
+        ImGui::BeginChild("##diaglog", ImVec2(0.0f, 0.0f), true,
                           ImGuiWindowFlags_HorizontalScrollbar);
         for (const auto& ev : log) {
             ImVec4 col = (ev.level == DiagEvent::Warning) ? ImVec4(1.0f, 0.9f, 0.2f, 1.0f) :

@@ -22,16 +22,73 @@ public:
         double vds = ((nd_ > 0) ? x(nd_ - 1) : 0.0)
                    - ((ns_ > 0) ? x(ns_ - 1) : 0.0);
 
-        State ns = (vgs >= V_GATE_THRESHOLD) ? ON         :
-                   (vds  < -V_BD_THRESHOLD)  ? BODY_DIODE : OFF;
-        if (ns != state_) { state_ = ns; return true; }
-        return false;
+        State desired;
+        if (vgs >= V_GATE_THRESHOLD) {
+            // Gate high: channel ON.  Also clear body-diode anti-chatter flag.
+            desired             = ON;
+            justFlippedOff_     = false;
+            justExitedBodyDiode_ = false;
+        } else {
+            // Gate low: channel off.
+            // Body diode activates when Vds < -threshold, BUT:
+            //   (a) not immediately after the channel just turned OFF (justFlippedOff_)
+            //   (b) not if the body diode just exited in this same innerSolve (justExitedBodyDiode_)
+            // Both flags are reset at saveState / restoreState so each innerSolve starts fresh.
+            if (vds < -V_BD_THRESHOLD && !justFlippedOff_ && !justExitedBodyDiode_)
+                desired = BODY_DIODE;
+            else
+                desired = OFF;
+        }
+
+        if (desired == state_) return false;
+
+        bool changed = true;
+
+        // Track body-diode exit so it can't chatter back ON in the same innerSolve pass.
+        if (state_ == BODY_DIODE && desired == OFF)
+            justExitedBodyDiode_ = true;
+
+        // Track channel turn-off so body diode can't fire in the same innerSolve pass.
+        if (state_ == ON && desired == OFF)
+            justFlippedOff_ = true;
+
+        state_ = desired;
+        return changed;
     }
 
-    void reset() override { state_ = OFF; }
+    double getBranchCurrent(const Eigen::VectorXd& x, size_t) const override {
+        double vd = (nd_ > 0) ? x(nd_ - 1) : 0.0;
+        double vs = (ns_ > 0) ? x(ns_ - 1) : 0.0;
+        double vds = vd - vs;
+        switch (state_) {
+        case ON:
+            // Channel: current flows drain→source (positive for normal operation)
+            return vds / R_ON;
+        case BODY_DIODE:
+            // Body diode: current flows source→drain (negative Ids direction).
+            // Clamp to negative-only: body diode cannot carry positive (forward) current.
+            {
+                double i = vds / BODY_R_ON;
+                return (i < 0.0) ? i : 0.0;
+            }
+        default: // OFF
+            return 0.0;  // leakage negligible; report 0 for clean scope traces
+        }
+    }
 
-    void saveState() override    { savedState_ = state_; }
-    void restoreState() override { state_ = savedState_; }
+    void reset() override { state_ = OFF; justFlippedOff_ = false; justExitedBodyDiode_ = false; }
+
+    void saveState() override {
+        savedState_          = state_;
+        justFlippedOff_      = false;   // fresh start for new timestep
+        justExitedBodyDiode_ = false;
+    }
+    void restoreState() override {
+        state_               = savedState_;
+        justFlippedOff_      = false;   // fresh start for ZC sub-step
+        justExitedBodyDiode_ = false;
+    }
+
     bool stateChangedSinceLastSave() const override { return state_ != savedState_; }
 
 private:
@@ -41,9 +98,13 @@ private:
     State state_      = OFF;
     State savedState_ = OFF;
 
+    // Anti-chatter flags (per-innerSolve, reset by saveState/restoreState):
+    bool justFlippedOff_      = false;  // ON→OFF: block immediate body-diode activation
+    bool justExitedBodyDiode_ = false;  // BODY_DIODE→OFF: block immediate re-entry
+
     static constexpr double R_ON             = 1e-3;
-    static constexpr double BODY_R_ON        = 2e-3;   // body diode forward resistance
+    static constexpr double BODY_R_ON        = 2e-3;
     static constexpr double R_OFF            = 1e9;
     static constexpr double V_GATE_THRESHOLD = 0.5;
-    static constexpr double V_BD_THRESHOLD   = 1e-3;   // 1 mV hysteresis at Vds = 0
+    static constexpr double V_BD_THRESHOLD   = 1e-3;   // 1 mV body-diode activation
 };

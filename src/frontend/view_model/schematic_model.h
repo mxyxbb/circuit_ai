@@ -88,6 +88,11 @@ public:
     std::unordered_map<int,int> computePinNodeMap() const;
     static int pinKey(int compId, int pinIdx) { return compId * 64 + pinIdx; }
 
+    // Returns the user-assigned netName for a given SPICE node ID (empty if none).
+    std::string getNetNameForNode(int nodeId) const;
+    // Returns netName → nodeId mapping for all wires that have a netName.
+    std::unordered_map<std::string, int> computeNetNameToNodeMap() const;
+
     // Persist / restore schematic (custom .sch text format)
     bool saveToFile(const std::string& path) const;
     bool loadFromFile(const std::string& path);
