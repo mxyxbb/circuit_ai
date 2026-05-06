@@ -53,6 +53,7 @@ public:
             justFlippedOff_ = true;
 
         state_ = desired;
+        flippedSinceSave_ = true;
         return changed;
     }
 
@@ -76,20 +77,28 @@ public:
         }
     }
 
-    void reset() override { state_ = OFF; justFlippedOff_ = false; justExitedBodyDiode_ = false; }
+    void reset() override {
+        state_               = OFF;
+        justFlippedOff_      = false;
+        justExitedBodyDiode_ = false;
+        flippedSinceSave_    = false;
+    }
 
     void saveState() override {
         savedState_          = state_;
         justFlippedOff_      = false;   // fresh start for new timestep
         justExitedBodyDiode_ = false;
+        flippedSinceSave_    = false;
     }
     void restoreState() override {
         state_               = savedState_;
         justFlippedOff_      = false;   // fresh start for ZC sub-step
         justExitedBodyDiode_ = false;
+        flippedSinceSave_    = false;
     }
 
     bool stateChangedSinceLastSave() const override { return state_ != savedState_; }
+    bool flippedSinceLastSave()      const override { return flippedSinceSave_; }
 
 private:
     enum State { OFF, ON, BODY_DIODE };
@@ -101,6 +110,7 @@ private:
     // Anti-chatter flags (per-innerSolve, reset by saveState/restoreState):
     bool justFlippedOff_      = false;  // ON→OFF: block immediate body-diode activation
     bool justExitedBodyDiode_ = false;  // BODY_DIODE→OFF: block immediate re-entry
+    bool flippedSinceSave_    = false;  // any state change since saveState (transient or persistent)
 
     static constexpr double R_ON             = 1e-3;
     static constexpr double BODY_R_ON        = 2e-3;

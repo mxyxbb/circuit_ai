@@ -117,6 +117,7 @@ void Simulator::reset() {
     t_.store(0.0);
     stepCount_ = 0;
     beStepsRemaining_ = 0;
+    startedAtEventBoundary_ = false;
     // Reset component internal states (inductor iPrev, capacitor vPrev, etc.)
     if (circuit_) {
         for (const auto& comp : circuit_->components()) {
@@ -155,10 +156,48 @@ void Simulator::runLoop() {
 bool Simulator::step() {
     constexpr int MAX_ITER     = 50;
     constexpr int MAX_ZC_BISECT = 8;  // dt / 2^8 = dt/256 crossing accuracy
-    const double dt = config_.dt;
+    const double dtNominal = config_.dt;
     double t = t_.load();
 
-    bool useBE = (beStepsRemaining_ > 0);
+    // Event-time scheduling: clip the step so its boundary lands exactly on
+    // the next scheduled discontinuity advertised by any component (e.g. a
+    // PWM gate edge). Smooth components return +inf and don't affect effDt.
+    // The +dtTolerance slop is critical: t accumulates FP rounding (~1 ULP per
+    // step), so after many cycles the computed dtToEv may be dtNominal+ε for
+    // edges that mathematically align with the grid. Without tolerance, those
+    // edges fall through to the ZC-bisection path *without* startedAtEventBoundary_
+    // set, which leaves TR active for the discontinuity step and kicks the LC
+    // filter -- producing the non-periodic burst-mode wobble we'd otherwise see.
+    // We extend the step (rather than truncate to dtNominal) so the boundary
+    // lands exactly on the edge; an extension of < 1 ULP is numerically harmless.
+    double effDt = dtNominal;
+    bool clippedToEvent = false;
+    // dtTolerance must absorb the late-time FP rounding accumulated in `t` over
+    // many step additions. After ~2e5 dt additions the per-ULP slop in `t` can
+    // reach 1e-13 to 1e-14 -- a tolerance of 1e-17 (relative 1e-9) was too tight,
+    // letting some "natural-grid" edges fall through to ZC bisection and inject
+    // dt/256 step offsets that pump the LC filter at specific cycle counts.
+    // 1e-3 of dtNominal (= 1e-11) absorbs any plausible accumulation while still
+    // being 7 orders of magnitude smaller than dtNominal -- can't cause spurious
+    // clipping of events far in the future.
+    const double dtTolerance = dtNominal * 1e-3;
+    for (const auto& comp : circuit_->components()) {
+        double tEv = comp->nextEventAfter(t);
+        double dtToEv = tEv - t;
+        if (dtToEv > 0.0 && dtToEv <= effDt + dtTolerance) {
+            effDt = dtToEv;          // land exactly on edge (may slightly exceed dtNominal by FP slop)
+            clippedToEvent = true;
+        }
+    }
+
+    // Force BE for the step that starts AT a scheduled event boundary. The
+    // source value jumps discontinuously at t (the gate just flipped), so
+    // trapezoidal would ring on the step input. The pre-existing ZC bisection
+    // path achieved this implicitly by leaving useBE_=true after the inner
+    // bisection loop; since we now skip that loop on event boundaries, set BE
+    // explicitly here. beStepsRemaining_ is still set to 3 below to damp the
+    // following steps, mirroring the old behavior.
+    bool useBE = (beStepsRemaining_ > 0) || startedAtEventBoundary_;
     for (const auto& comp : circuit_->components())
         comp->setUseBE(useBE);
 
@@ -206,20 +245,36 @@ bool Simulator::step() {
         return false;
     };
 
-    // Full step to t + dt
-    bool converged = innerSolve(dt, t);
+    // Helper: did ANY component flip during the inner solve, even if it
+    // ultimately re-converged to its saved state? Distinguishes transient
+    // chatter (e.g. diode flipping OFF then back ON across iterations near
+    // i = 0) from pure no-event steps. Used to (a) narrow the ZC bisection
+    // when a transient crossing exists inside the sub-step interval, and
+    // (b) arm BE damping so the next-step TR doesn't ring on the residual
+    // history left by the chatter.
+    auto anyComponentFlipped = [&]() -> bool {
+        for (const auto& comp : circuit_->components())
+            if (comp->flippedSinceLastSave()) return true;
+        return false;
+    };
+
+    // Full step to t + effDt
+    bool converged = innerSolve(effDt, t);
     // Only trigger ZC bisection when:
     //   1. The solve converged (no chattering), AND
-    //   2. The final state truly differs from the saved initial state.
-    // Chattering (MAX_ITER exhausted) is treated as "no reliable crossing" — just proceed.
+    //   2. The final state truly differs from the saved initial state, AND
+    //   3. We did NOT just start at a scheduled event boundary. In that case
+    //      the change is the source edge landing exactly on this step's start;
+    //      bisecting would converge to dtHi -> 0 and waste a solve.
     bool anyStateChange = converged && finalStateChanged();
-    double stepDt = dt;
+    bool runBisection   = anyStateChange && !startedAtEventBoundary_;
+    double stepDt = effDt;
 
-    if (anyStateChange) {
-        // Zero-crossing bisection: narrow [dtLo, dtHi] to locate t_zc to dt/2^MAX_ZC_BISECT.
+    if (runBisection) {
+        // Zero-crossing bisection: narrow [dtLo, dtHi] to locate t_zc to effDt/2^MAX_ZC_BISECT.
         // dtLo = largest sub-step with no net state change (pre-crossing)
         // dtHi = smallest sub-step with net state change  (post-crossing ≈ t_zc)
-        double dtLo = 0.0, dtHi = dt;
+        double dtLo = 0.0, dtHi = effDt;
         for (int b = 0; b < MAX_ZC_BISECT; ++b) {
             if (stopRequested_.load(std::memory_order_relaxed)) break;
             double dtMid = (dtLo + dtHi) * 0.5;
@@ -228,9 +283,15 @@ bool Simulator::step() {
                 comp->setUseBE(true);
             }
             bool midConverged = innerSolve(dtMid, t);
-            // If solve didn't converge at this sub-step, treat as "no crossing yet"
-            if (midConverged && finalStateChanged()) dtHi = dtMid;
-            else                                     dtLo = dtMid;
+            // Narrow when EITHER the final state differs (persistent crossing)
+            // OR any component flipped during the inner solve (transient chatter
+            // hidden inside [t, t+dtMid] -- final state matches saved but a
+            // crossing is real and inside this interval). If solve didn't
+            // converge, treat as "no crossing yet" and grow dtLo.
+            if (midConverged && (finalStateChanged() || anyComponentFlipped()))
+                dtHi = dtMid;
+            else
+                dtLo = dtMid;
         }
 
         // Final solve at dtHi: this is the step that includes the crossing.
@@ -240,10 +301,45 @@ bool Simulator::step() {
         }
         innerSolve(dtHi, t);
         stepDt = dtHi;
+    }
 
-        beStepsRemaining_ = 3;
+    // Arm BE damping window when any flip occurred -- persistent (anyStateChange)
+    // OR transient chatter that re-converged (e.g. diode flipping OFF then back
+    // ON near i_diode = 0 in a DCM transition). The chatter case would otherwise
+    // be invisible to the persistent-only check, leaving TR to ring on the small
+    // history inconsistencies the chatter deposited on iPrev_/vPrev_.
+    bool transientChatter = converged && !finalStateChanged() && anyComponentFlipped();
+    if (anyStateChange || transientChatter) {
+        // 8 BE steps after any flip event. With 100 kHz PWM and dt = 1e-8
+        // (500 dt per half-cycle), that is 1.6% of the half-cycle in BE --
+        // accuracy hit is negligible, but the extra damping smooths any kick
+        // that would otherwise excite the output LC filter.
+        beStepsRemaining_ = 8;
     } else if (beStepsRemaining_ > 0) {
         --beStepsRemaining_;
+    }
+
+    // Diagnostic: instrumented to show WHICH components flipped and what their
+    // saved-vs-current states are. This is what the user sees in the panel and
+    // is the key data for narrowing the burst root cause.
+    if (runBisection) {
+        char buf[160];
+        // Walk components and build a compact list of who changed.
+        // We use stateChangedSinceLastSave() on switches/diodes; report by index.
+        char who[80] = {0};
+        size_t off = 0;
+        size_t ci = 0;
+        for (const auto& comp : circuit_->components()) {
+            if (comp->stateChangedSinceLastSave() && off + 8 < sizeof(who)) {
+                int n = snprintf(who + off, sizeof(who) - off, "[%zu]%s ",
+                                 ci, comp->name().c_str());
+                if (n > 0) off += static_cast<size_t>(n);
+            }
+            ci++;
+        }
+        snprintf(buf, sizeof(buf),
+                 "t=%.6e: ZC bisect non-evt: %s", t, who);
+        diagRing_.push({DiagEvent::Warning, t, buf});
     }
 
     const auto& x = solver_->lastSolution();
@@ -293,6 +389,11 @@ bool Simulator::step() {
     }
 
     t_ = t + stepDt;
+    // If we clipped the step to a scheduled event AND we actually advanced to
+    // that event (no ZC bisection truncated the step earlier), the next step
+    // starts at the discontinuity. Tell the next step to skip ZC bisection
+    // for the resulting state change.
+    startedAtEventBoundary_ = clippedToEvent && !runBisection;
     stepCount_++;
     return true;
 }

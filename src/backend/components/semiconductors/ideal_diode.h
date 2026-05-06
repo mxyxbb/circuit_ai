@@ -36,6 +36,11 @@ public:
         bool changed = false;
         if (isOn_) {
             // Turn OFF as soon as Vak < 0: ideal diode carries no reverse current.
+            // (A larger hysteresis like Vak < -1 mV would let the diode keep R_ON
+            // active for reverse current up to V_OFF/R_ON = 1 A — that's a model
+            // error, not a hysteresis margin. Anti-chatter is provided instead by
+            // justFlippedOff_ within an innerSolve and by `flippedSinceLastSave`
+            // tracking + BE arming across innerSolves.)
             if (vak < 0.0) {
                 isOn_         = false;
                 changed       = true;
@@ -49,28 +54,33 @@ public:
                 changed = true;
             }
         }
+        if (changed) flippedSinceSave_ = true;
         return changed;
     }
 
     // saveState / restoreState called by the simulator around each innerSolve call.
     // Both reset justFlippedOff_ so every new solve pass starts fresh.
     void saveState() override {
-        savedIsOn_      = isOn_;
-        justFlippedOff_ = false;
+        savedIsOn_        = isOn_;
+        justFlippedOff_   = false;
+        flippedSinceSave_ = false;
     }
     void restoreState() override {
-        isOn_           = savedIsOn_;
-        justFlippedOff_ = false;
+        isOn_             = savedIsOn_;
+        justFlippedOff_   = false;
+        flippedSinceSave_ = false;
     }
 
     bool stateChangedSinceLastSave() const override { return isOn_ != savedIsOn_; }
+    bool flippedSinceLastSave()      const override { return flippedSinceSave_; }
 
 private:
     std::string name_;
     int  na_, nk_;
-    bool isOn_          = false;
-    bool savedIsOn_     = false;
-    bool justFlippedOff_ = false;   // per-innerSolve anti-chatter flag
+    bool isOn_             = false;
+    bool savedIsOn_        = false;
+    bool justFlippedOff_   = false;   // per-innerSolve anti-chatter flag
+    bool flippedSinceSave_ = false;   // true if updateState reported any flip since saveState
 
     static constexpr double R_ON  = 1e-3;   // on-state resistance (1 mΩ)
     static constexpr double R_OFF = 1e9;    // off-state resistance (1 GΩ)

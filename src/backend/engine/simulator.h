@@ -71,4 +71,11 @@ private:
     SPSCRingBuffer<DiagEvent, 256>   diagRing_;   // power-of-2; drop-newest on overflow
     size_t stepCount_ = 0;
     int beStepsRemaining_ = 0;  // steps remaining in forced-BE mode after a switch event
+
+    // True when the previous step was clipped to land exactly on a scheduled
+    // source event (PWM edge etc.). The current step therefore starts at the
+    // discontinuity, and any switch state change in this step is the *expected*
+    // consequence of the source edge -- skip the ZC bisection in that case to
+    // avoid a wasted near-zero sub-step.
+    bool startedAtEventBoundary_ = false;
 };
