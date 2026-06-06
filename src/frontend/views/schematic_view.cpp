@@ -12,6 +12,10 @@
 
 #include "views/schematic_view.h"
 #include "views/scope_view.h"
+#include "views/schematic_svg_export.h"
+#ifdef _WIN32
+#include "views/schematic_clipboard_win32.h"
+#endif
 #include "view_model/main_view_model.h"
 #include "view_model/scope_model.h"
 #include "view_model/schematic_model.h"
@@ -20,6 +24,8 @@
 #include <imgui_internal.h>
 #include <cmath>
 #include <cctype>
+#include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <algorithm>
 #include <unordered_map>
@@ -52,6 +58,17 @@ static bool pickSavePath(char* buf, int n) {
     ofn.nMaxFile    = static_cast<DWORD>(n);
     ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR;
     ofn.lpstrDefExt = "sch";
+    buf[0] = '\0';
+    return GetSaveFileNameA(&ofn) != 0;
+}
+static bool pickSvgSavePath(char* buf, int n) {
+    OPENFILENAMEA ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.lpstrFilter = "SVG (Inkscape, PowerPoint)\0*.svg\0All Files\0*.*\0\0";
+    ofn.lpstrFile   = buf;
+    ofn.nMaxFile    = static_cast<DWORD>(n);
+    ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR;
+    ofn.lpstrDefExt = "svg";
     buf[0] = '\0';
     return GetSaveFileNameA(&ofn) != 0;
 }
@@ -399,6 +416,7 @@ void SchematicView::render(MainViewModel& vm) {
         ImGui::End();
         return;
     }
+    // (File operations now live in the main-window menu bar; see MainView.)
 
     // ── Multi-doc tab bar ─────────────────────────────────────────────────
     {
@@ -482,37 +500,8 @@ void SchematicView::render(MainViewModel& vm) {
             if (ImGui::Button("Build & Run", btnSz)) vm.requestBuild();
         }
     }
-    ImGui::SameLine();
-    if (ImGui::Button("Clear")) {
-        sch.clear();
-        selectedCompId_ = selectedWireId_ = propEditCompId_ = movingCompId_ = -1;
-        multiSelectedIds_.clear(); multiMoveOrigPos_.clear(); selBoxActive_ = false;
-        wiringActive_ = false;
-    }
-    ImGui::SameLine();
-#ifdef _WIN32
-    if (ImGui::Button("Save")) {
-        char path[512] = {};
-        if (!savedFilePath_.empty()) {
-            // Already has a path: save directly
-            strncpy(path, savedFilePath_.c_str(), sizeof(path)-1);
-            doSave(path, vm);
-        } else if (pickSavePath(path, sizeof(path))) {
-            doSave(path, vm);
-        }
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Save As...")) {
-        char path[512] = {};
-        if (pickSavePath(path, sizeof(path)))
-            doSave(path, vm);
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Load")) {
-        char path[512] = {};
-        if (pickOpenPath(path, sizeof(path)))
-            doLoad(path, vm);
-    }
+    // I/O status (Save / Load / Export feedback) appears inline next to
+    // Build & Run since the file actions themselves now live in the File menu.
     if (ioStatusTimer_ > 0.f) {
         ImGui::SameLine();
         bool fail = (std::strstr(ioStatus_, "failed") != nullptr);
@@ -520,7 +509,6 @@ void SchematicView::render(MainViewModel& vm) {
                                 : ImVec4(0.3f,1.f,0.45f,1.f), "%s", ioStatus_);
     }
     ImGui::SameLine();
-#endif
     ImGui::TextDisabled("|");
     ImGui::SameLine();
     ImGui::TextDisabled("dt:");
@@ -1138,14 +1126,36 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
     else if (hovered && probeMode_ == PM_None && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         bool hitPin = false, hitBody = false;
 
-        // Priority 1: pins (use rotated positions)
+        // Priority 1: pins (use rotated positions). Asymmetric hit region:
+        // generous in the OUTWARD direction (away from comp body) so the user
+        // can grab the pin from its "free" side; tight inward and perpendicular
+        // so it doesn't shadow the body or adjacent pins. For pins at the
+        // component center (e.g. JUNC, GND) the outward direction is degenerate;
+        // fall back to a small symmetric circle.
+        const float pinOutward = 14.0f / zoom_;
+        const float pinInward  = 4.0f  / zoom_;
+        const float pinPerp    = 5.0f  / zoom_;
         for (auto& comp : sch.comps()) {
             const CompTypeDef* td = SchematicModel::findCompType(comp.typeId);
             if (!td) continue;
             for (int pi = 0; pi < (int)td->pins.size(); ++pi) {
                 ImVec2 pPos = pinCanvasPos(comp, pi);
-                float dx = mousePt.x - pPos.x, dy = mousePt.y - pPos.y;
-                if (dx*dx + dy*dy <= hitR*hitR) {
+                float toPx = mousePt.x - pPos.x, toPy = mousePt.y - pPos.y;
+                float ox   = pPos.x - comp.pos.x, oy = pPos.y - comp.pos.y;
+                float olen = sqrtf(ox*ox + oy*oy);
+                bool pinHit;
+                if (olen < 1.0f) {
+                    // Center-pin component (JUNC, GND): fall back to small circle.
+                    pinHit = (toPx*toPx + toPy*toPy <= hitR*hitR);
+                } else {
+                    float onx = ox / olen, ony = oy / olen;
+                    float along = toPx * onx + toPy * ony;
+                    float pxr   = toPx - along * onx;
+                    float pyr   = toPy - along * ony;
+                    float perp  = sqrtf(pxr*pxr + pyr*pyr);
+                    pinHit = (along >= -pinInward && along <= pinOutward && perp <= pinPerp);
+                }
+                if (pinHit) {
                     if (wiringActive_) {
                         if (comp.id != wireFromCompId_ || pi != wireFromPinIdx_) {
                             pushUndo(undoStack_, redoStack_, sch, kMaxUndo);
@@ -1222,8 +1232,26 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
                 // Body half-size swaps on 90°/270°
                 float bx = td->bodyHalfSize.x, by = td->bodyHalfSize.y;
                 if (comp.rotation % 2 == 1) std::swap(bx, by);
-                if (mousePt.x >= comp.pos.x - bx && mousePt.x <= comp.pos.x + bx &&
-                    mousePt.y >= comp.pos.y - by && mousePt.y <= comp.pos.y + by) {
+                // Generic AABB body hit unless overridden below.
+                bool bodyHit = (mousePt.x >= comp.pos.x - bx && mousePt.x <= comp.pos.x + bx &&
+                                mousePt.y >= comp.pos.y - by && mousePt.y <= comp.pos.y + by);
+                if (comp.typeId == "GND") {
+                    // The ground symbol is asymmetric: pin sits at comp.pos and
+                    // the bars extend ONE direction along the stem (rotation
+                    // dependent). A symmetric AABB hits empty space on the
+                    // opposite side. Use a directional rectangle that tracks
+                    // the actual visual: 0..18 along the stem direction, ±6
+                    // perpendicular.
+                    ImVec2 sv = rotateOff({0.0f, 1.0f}, comp.rotation);  // stem direction
+                    float dxp = mousePt.x - comp.pos.x;
+                    float dyp = mousePt.y - comp.pos.y;
+                    float along = dxp * sv.x + dyp * sv.y;
+                    float pxr   = dxp - along * sv.x;
+                    float pyr   = dyp - along * sv.y;
+                    float perp  = sqrtf(pxr*pxr + pyr*pyr);
+                    bodyHit = (along >= -2.0f && along <= 18.0f && perp <= 6.0f);
+                }
+                if (bodyHit) {
                     wiringActive_ = false;
                     wireWaypoints_.clear();
 
@@ -1596,10 +1624,13 @@ void SchematicView::drawTxCoreSymbol(ImDrawList* dl, const SchematicComp& txCore
     };
     std::vector<ImVec2> mids;
     for (const auto* wc:winds){
-        // Dashed bar on the "flat" side (-x before mirrorX), ±24 along winding axis
-        ImVec2 top = windSC(*wc, -14.f, -24.f);
-        ImVec2 bot = windSC(*wc, -14.f, +24.f);
-        ImVec2 mid = windSC(*wc, -14.f,   0.f);
+        // Dashed bar on the "bumpy" side (+x before mirrorX), ±24 along winding axis.
+        // Per user request the core line and inter-winding connector live on the
+        // same side as the winding bumps now; the polarity dot in TX_WIND moved
+        // with it to remain on the core side.
+        ImVec2 top = windSC(*wc, +14.f, -24.f);
+        ImVec2 bot = windSC(*wc, +14.f, +24.f);
+        ImVec2 mid = windSC(*wc, +14.f,   0.f);
         drawDashedLine(dl, top, bot, dc, 1.3f*z, 5.f*z, 3.f*z);
         mids.push_back(mid);
     }
@@ -1882,15 +1913,20 @@ void SchematicView::drawCompSymbol(ImDrawList* dl, const SchematicComp& comp,
     // ── Net label ─────────────────────────────────────────────────────────
     else if (id == "NETLABEL") {
         ImU32 nc = sel ? IM_COL32(255,210,50,255) : IM_COL32(80,230,120,255);
-        dl->AddLine(sc(-20,0), sc(0,0), nc, thick);  // lead
-        // Flag pentagon
-        dl->PathLineTo(sc(0,-7)); dl->PathLineTo(sc(+12,-7));
-        dl->PathLineTo(sc(+16,0)); dl->PathLineTo(sc(+12,+7));
-        dl->PathLineTo(sc(0,+7));
+        // Compact flag pentagon -- the pin is at (-20,0) and the flag tip
+        // points to (-4,0) so the connection point IS the flag's leftmost
+        // notch. No separate pin lead line; the flag itself indicates the
+        // attachment direction.
+        dl->PathLineTo(sc(-20,0));
+        dl->PathLineTo(sc(-16,-7));
+        dl->PathLineTo(sc(-4,-7));
+        dl->PathLineTo(sc(-4,+7));
+        dl->PathLineTo(sc(-16,+7));
         dl->PathStroke(nc, ImDrawFlags_Closed, thick*0.7f);
-        // Label text
+        // Label text -- offset away from the flag toward +x so it doesn't
+        // overlap the symbol.
         if (!comp.paramValues.empty()) {
-            ImVec2 lc = sc(+8,0);
+            ImVec2 lc = sc(+10,0);
             ImVec2 ts = ImGui::CalcTextSize(comp.paramValues[0].c_str());
             dl->AddText({lc.x-ts.x*.5f, lc.y-ts.y*.5f}, nc, comp.paramValues[0].c_str());
         }
@@ -1909,9 +1945,10 @@ void SchematicView::drawCompSymbol(ImDrawList* dl, const SchematicComp& comp,
             }
         }
         dl->PathStroke(col, 0, thick);
-        // Polarity dot at P-side, on the flat/core side (-x before mirrorX)
+        // Polarity dot at P-side, on the core side (+x before mirrorX -- moved
+        // along with the TX_CORE dashed bar/connector to remain on the core).
         { ImU32 dc=sel?IM_COL32(255,230,100,255):IM_COL32(220,230,255,240);
-          dl->AddCircleFilled(sc(-10,-22),2.5f*z,dc); }
+          dl->AddCircleFilled(sc(+10,-22),2.5f*z,dc); }
         // Turns label to the right
         if (comp.paramValues.size() >= 3) {
             char lbl[24]; std::snprintf(lbl,sizeof(lbl),"n=%s",comp.paramValues[2].c_str());
@@ -1953,6 +1990,19 @@ void SchematicView::drawComponents(ImDrawList* dl, MainViewModel& vm, ImVec2 ori
             }
             hovICompName = std::move(s);
         }
+    }
+
+    // Pre-compute: number of wire endpoints terminating at each (compId, pinIdx).
+    // Used by the pin-dot renderer to switch styling: 1 wire = "single connection"
+    // (small blue), 0 or 2+ wires = existing green/yellow dot. Junctions still
+    // draw their own dot via the JUNC component path.
+    std::unordered_map<int64_t, int> wireCountPerPin;
+    auto pinKey = [](int compId, int pinIdx) -> int64_t {
+        return (static_cast<int64_t>(compId) << 16) | static_cast<int64_t>(pinIdx);
+    };
+    for (const auto& wire : sch.wires()) {
+        wireCountPerPin[pinKey(wire.fromCompId, wire.fromPinIdx)]++;
+        wireCountPerPin[pinKey(wire.toCompId,   wire.toPinIdx  )]++;
     }
 
     for (const auto& comp : sch.comps()) {
@@ -2029,10 +2079,27 @@ void SchematicView::drawComponents(ImDrawList* dl, MainViewModel& vm, ImVec2 ori
             ImVec2 pinCanvas = pinCanvasPos(comp, pi);
             ImVec2 pinScr    = c2s(pinCanvas, origin);
 
-            // Pin circle
+            // Pin circle. Three styles depending on wire count terminating here:
+            //   isStart (wire drag in progress): bright green, full size.
+            //   exactly 1 wire connected:        small blue dot (clean look for
+            //                                    direct pin-to-wire join).
+            //   0 or 2+ wires:                   default green dot (signals an
+            //                                    unconnected pin or a fan-out;
+            //                                    junctions get their own dot
+            //                                    via the JUNC component path).
             bool isStart = (wiringActive_ && wireFromCompId_==comp.id && wireFromPinIdx_==pi);
-            dl->AddCircleFilled(pinScr, 4.0f*zoom_,
-                                isStart ? IM_COL32(50,255,100,255) : IM_COL32(80,200,120,255));
+            int wireCount = 0;
+            {
+                auto it = wireCountPerPin.find(pinKey(comp.id, pi));
+                if (it != wireCountPerPin.end()) wireCount = it->second;
+            }
+            if (isStart) {
+                dl->AddCircleFilled(pinScr, 4.0f*zoom_, IM_COL32(50,255,100,255));
+            } else if (wireCount == 1) {
+                dl->AddCircleFilled(pinScr, 2.5f*zoom_, IM_COL32(120,170,255,255));
+            } else {
+                dl->AddCircleFilled(pinScr, 4.0f*zoom_, IM_COL32(80,200,120,255));
+            }
 
             // Polarity "+" label (accounts for mirrorX + rotation)
             const char* polSym = polaritySymbol(td->pins[pi].label);
@@ -2127,13 +2194,101 @@ void SchematicView::renderProperties(MainViewModel& vm) {
         c->instanceName = propNameBuf_;
     }
 
+    // Indices of the freq / tdelay / phase / _linkBy params for V_SQUARE so the
+    // bidirectional linkage can update the right cells after each edit.
+    int idxFreq = -1, idxTDelay = -1, idxPhase = -1, idxLinkBy = -1;
+    if (c->typeId == "V_SQUARE") {
+        for (int i = 0; i < (int)td->params.size(); ++i) {
+            const std::string& nm = td->params[i].name;
+            if      (nm.rfind("freq",   0) == 0) idxFreq   = i;
+            else if (nm.rfind("tdelay", 0) == 0) idxTDelay = i;
+            else if (nm.rfind("phase",  0) == 0) idxPhase  = i;
+            else if (nm == "_linkBy")            idxLinkBy = i;
+        }
+    }
+
     for (int i = 0; i < (int)td->params.size() && i < 8; ++i) {
+        if (td->params[i].hidden) continue;     // skip internal book-keeping params
         ImGui::SameLine();
         ImGui::SetNextItemWidth(120.0f);
         ImGui::InputText(td->params[i].name.c_str(), propBufs_[i], sizeof(propBufs_[i]));
         if (ImGui::IsItemDeactivatedAfterEdit() && i < (int)c->paramValues.size()) {
             pushUndo(undoStack_, redoStack_, sch, kMaxUndo);
             c->paramValues[i] = propBufs_[i];
+
+            // V_SQUARE phase ↔ tdelay linkage: updating one recomputes the other,
+            // and "_linkBy" remembers which the user touched so a later freq
+            // change knows which to preserve. parseValue parses "1k" / "1m"
+            // suffixes the same way the netlist does.
+            if (idxFreq >= 0 && idxTDelay >= 0 && idxPhase >= 0 && idxLinkBy >= 0
+                && (i == idxFreq || i == idxTDelay || i == idxPhase))
+            {
+                auto parseNum = [](const std::string& s) -> double {
+                    if (s.empty()) return 0.0;
+                    char* end = nullptr;
+                    double v = std::strtod(s.c_str(), &end);
+                    if (end && *end) {
+                        switch (*end) {
+                            case 'p': v *= 1e-12; break;
+                            case 'n': v *= 1e-9;  break;
+                            case 'u': v *= 1e-6;  break;
+                            case 'm': v *= 1e-3;  break;
+                            case 'k': case 'K': v *= 1e3;  break;
+                            case 'M': v *= 1e6;  break;
+                            case 'G': v *= 1e9;  break;
+                            default: break;
+                        }
+                    }
+                    return v;
+                };
+                double freq   = parseNum(c->paramValues[idxFreq]);
+                double tdelay = parseNum(c->paramValues[idxTDelay]);
+                double phase  = parseNum(c->paramValues[idxPhase]);
+                if (freq > 0.0) {
+                    auto fmt = [](double v) {
+                        char buf[32];
+                        std::snprintf(buf, sizeof(buf), "%.6g", v);
+                        return std::string(buf);
+                    };
+                    if (i == idxPhase) {
+                        // User typed phase → recompute tdelay from it.
+                        tdelay = phase / 360.0 / freq;
+                        c->paramValues[idxTDelay] = fmt(tdelay);
+                        strncpy(propBufs_[idxTDelay], c->paramValues[idxTDelay].c_str(),
+                                sizeof(propBufs_[idxTDelay]) - 1);
+                        propBufs_[idxTDelay][sizeof(propBufs_[idxTDelay]) - 1] = '\0';
+                        c->paramValues[idxLinkBy] = "phase";
+                    } else if (i == idxTDelay) {
+                        // User typed tdelay → recompute phase. Wrap into ±360°.
+                        phase = std::fmod(tdelay * freq * 360.0, 360.0);
+                        if (phase >  180.0) phase -= 360.0;
+                        if (phase < -180.0) phase += 360.0;
+                        c->paramValues[idxPhase] = fmt(phase);
+                        strncpy(propBufs_[idxPhase], c->paramValues[idxPhase].c_str(),
+                                sizeof(propBufs_[idxPhase]) - 1);
+                        propBufs_[idxPhase][sizeof(propBufs_[idxPhase]) - 1] = '\0';
+                        c->paramValues[idxLinkBy] = "tdelay";
+                    } else if (i == idxFreq) {
+                        // Frequency changed → preserve whichever the user last set.
+                        const std::string& linkBy = c->paramValues[idxLinkBy];
+                        if (linkBy == "phase") {
+                            tdelay = phase / 360.0 / freq;
+                            c->paramValues[idxTDelay] = fmt(tdelay);
+                            strncpy(propBufs_[idxTDelay], c->paramValues[idxTDelay].c_str(),
+                                    sizeof(propBufs_[idxTDelay]) - 1);
+                            propBufs_[idxTDelay][sizeof(propBufs_[idxTDelay]) - 1] = '\0';
+                        } else {
+                            phase = std::fmod(tdelay * freq * 360.0, 360.0);
+                            if (phase >  180.0) phase -= 360.0;
+                            if (phase < -180.0) phase += 360.0;
+                            c->paramValues[idxPhase] = fmt(phase);
+                            strncpy(propBufs_[idxPhase], c->paramValues[idxPhase].c_str(),
+                                    sizeof(propBufs_[idxPhase]) - 1);
+                            propBufs_[idxPhase][sizeof(propBufs_[idxPhase]) - 1] = '\0';
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -2144,4 +2299,74 @@ void SchematicView::renderProperties(MainViewModel& vm) {
         c->rotation = (c->rotation + 1) % 4;
         propEditCompId_ = -1;  // force buffer refresh next frame
     }
+}
+
+// ── Public File-action API ─────────────────────────────────────────────────
+// These are invoked from the main-window menu bar. They mirror what the
+// per-window toolbar buttons used to do; status messages still appear in the
+// schematic toolbar (ioStatus_ / ioStatusTimer_).
+
+void SchematicView::fileSave(MainViewModel& vm) {
+#ifdef _WIN32
+    char path[512] = {};
+    if (!savedFilePath_.empty()) {
+        strncpy(path, savedFilePath_.c_str(), sizeof(path)-1);
+        doSave(path, vm);
+    } else if (pickSavePath(path, sizeof(path))) {
+        doSave(path, vm);
+    }
+#else
+    (void)vm;
+#endif
+}
+
+void SchematicView::fileSaveAs(MainViewModel& vm) {
+#ifdef _WIN32
+    char path[512] = {};
+    if (pickSavePath(path, sizeof(path)))
+        doSave(path, vm);
+#else
+    (void)vm;
+#endif
+}
+
+void SchematicView::fileLoad(MainViewModel& vm) {
+#ifdef _WIN32
+    char path[512] = {};
+    if (pickOpenPath(path, sizeof(path)))
+        doLoad(path, vm);
+#else
+    (void)vm;
+#endif
+}
+
+void SchematicView::fileExportSvg(MainViewModel& vm) {
+#ifdef _WIN32
+    char path[512] = {};
+    if (pickSvgSavePath(path, sizeof(path))) {
+        if (exportSchematicToSvgFile(vm.schematic(), path,
+                                     static_cast<double>(svgExportScale_))) {
+            std::snprintf(ioStatus_, sizeof(ioStatus_), "SVG exported");
+        } else {
+            std::snprintf(ioStatus_, sizeof(ioStatus_), "SVG export failed");
+        }
+        ioStatusTimer_ = 3.0f;
+    }
+#else
+    (void)vm;
+#endif
+}
+
+void SchematicView::fileCopyImg(MainViewModel& vm) {
+#ifdef _WIN32
+    if (copySchematicImageToClipboard(vm.schematic(),
+                                      static_cast<double>(svgExportScale_))) {
+        std::snprintf(ioStatus_, sizeof(ioStatus_), "Image copied to clipboard");
+    } else {
+        std::snprintf(ioStatus_, sizeof(ioStatus_), "Copy IMG failed");
+    }
+    ioStatusTimer_ = 3.0f;
+#else
+    (void)vm;
+#endif
 }

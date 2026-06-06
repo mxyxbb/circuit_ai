@@ -14,6 +14,10 @@ struct PinDef {
 struct ParamDef {
     std::string name;          // label shown in the property panel
     std::string defaultValue;  // initial value as string
+    // Internal book-keeping params (e.g. tracking which of phase/tdelay was
+    // last edited so freq changes update the right one). Hidden params are
+    // saved/loaded with the schematic but never appear in the property panel.
+    bool hidden = false;
 };
 
 // ── Static component type descriptor ─────────────────────────────────────────

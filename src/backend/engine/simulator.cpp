@@ -319,13 +319,13 @@ bool Simulator::step() {
         --beStepsRemaining_;
     }
 
-    // Diagnostic: instrumented to show WHICH components flipped and what their
-    // saved-vs-current states are. This is what the user sees in the panel and
-    // is the key data for narrowing the burst root cause.
+    // Informational: ZC bisection ran on a state-driven event (diode turn-on at
+    // freewheel start, DCM transition, etc.). Source-driven gate edges are
+    // handled by the event-scheduling clip path and don't reach here. List the
+    // component(s) whose state actually flipped so the panel is useful when
+    // looking at converter dynamics.
     if (runBisection) {
         char buf[160];
-        // Walk components and build a compact list of who changed.
-        // We use stateChangedSinceLastSave() on switches/diodes; report by index.
         char who[80] = {0};
         size_t off = 0;
         size_t ci = 0;
@@ -338,8 +338,8 @@ bool Simulator::step() {
             ci++;
         }
         snprintf(buf, sizeof(buf),
-                 "t=%.6e: ZC bisect non-evt: %s", t, who);
-        diagRing_.push({DiagEvent::Warning, t, buf});
+                 "t=%.6e: ZC bisection (state-driven): %s", t, who);
+        diagRing_.push({DiagEvent::Info, t, buf});
     }
 
     const auto& x = solver_->lastSolution();

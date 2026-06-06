@@ -32,9 +32,14 @@ static const std::vector<CompTypeDef> s_compTypes = {
       { {"V (V)", "5"} },
       {24,14} },
 
+    // V_SQUARE: phase (degrees) and tdelay (seconds) are linked. Editing one
+    // recomputes the other; on freq change we update whichever the user did
+    // NOT touch most recently. The trailing "_linkBy" param is hidden from
+    // the panel and persists "phase" or "tdelay" across saves.
     { "V_SQUARE", "Voltage Square", "V",
       { {"P",{-40,0}}, {"N",{40,0}} },
-      { {"freq (Hz)","1k"}, {"duty","0.5"}, {"Vhigh (V)","5"}, {"Vlow (V)","0"}, {"tdelay (s)","0"} },
+      { {"freq (Hz)","1k"}, {"duty","0.5"}, {"Vhigh (V)","5"}, {"Vlow (V)","0"},
+        {"tdelay (s)","0"}, {"phase (deg)","0"}, {"_linkBy","tdelay", true} },
       {24,14} },
 
     { "V_SIN",    "Voltage Sin",    "V",
@@ -57,9 +62,9 @@ static const std::vector<CompTypeDef> s_compTypes = {
       {},
       {24,14} },
 
-    { "S",        "Switch",         "S",
+    { "S",        "nmos",           "S",
       { {"D",{20,-40}}, {"S",{20,+40}}, {"G",{-20,0}}, {"GRef",{-20,+20}} },
-      {},
+      { {"Ron (Ohm)", "1m"} },
       {40,44} },
 
     { "TX",       "Transformer",    "TX",
@@ -404,8 +409,15 @@ std::string SchematicModel::generateNetlist(const SchematicSimConfig& cfg) const
         } else if (comp.typeId == "D") {
             oss << n << ' ' << nets[0] << ' ' << nets[1] << '\n';
         } else if (comp.typeId == "S") {
+            // Older .sch files predate the Ron parameter and may have an empty
+            // paramValues here. Emitting "Ron=" with no value would parse to
+            // rOn = 0 and crash the solver (1/0 conductance). Only attach the
+            // Ron= token when the parameter actually has a value -- the parser
+            // falls back to its 1 mΩ default otherwise.
             oss << n << ' ' << nets[0] << ' ' << nets[1]
-                << ' ' << nets[2] << ' ' << nets[3] << '\n';
+                << ' ' << nets[2] << ' ' << nets[3];
+            if (!p(0).empty()) oss << " Ron=" << p(0);
+            oss << '\n';
         } else if (comp.typeId == "TX") {
             oss << n << ' ' << nets[0] << ' ' << nets[1]
                 << ' ' << nets[2] << ' ' << nets[3]
@@ -574,6 +586,14 @@ bool SchematicModel::loadFromFile(const std::string& path) {
                     while (std::getline(ps, tok, '|'))
                         c.paramValues.push_back(tok);
                 }
+            }
+            // Backfill any params added to the type def AFTER this .sch was
+            // saved (e.g. V_SQUARE got phase/_linkBy in 2026-05). Without this,
+            // legacy schematics open with a short paramValues vector and the
+            // property panel reads out of bounds for the new fields.
+            if (const CompTypeDef* tdf = findCompType(c.typeId)) {
+                while (c.paramValues.size() < tdf->params.size())
+                    c.paramValues.push_back(tdf->params[c.paramValues.size()].defaultValue);
             }
             if (c.id > maxCompId) maxCompId = c.id;
             comps_.push_back(std::move(c));

@@ -3,15 +3,16 @@
 
 class IdealSwitch : public BaseComponent {
 public:
-    IdealSwitch(std::string name, int drain, int source, int gate, int gateRef)
+    IdealSwitch(std::string name, int drain, int source, int gate, int gateRef,
+                double rOn = 1e-3)
         : name_(std::move(name)), nd_(drain), ns_(source),
-          ng_(gate), ngr_(gateRef), state_(OFF) {}
+          ng_(gate), ngr_(gateRef), state_(OFF), rOn_(rOn) {}
 
     std::string name() const override { return name_; }
     int maxNode() const override { return std::max({nd_, ns_, ng_, ngr_}); }
 
     void stamp(MNASolver& solver, double, double, size_t) override {
-        double r = (state_ == ON)         ? R_ON      :
+        double r = (state_ == ON)         ? rOn_      :
                    (state_ == BODY_DIODE) ? BODY_R_ON : R_OFF;
         solver.stampConductance(nd_, ns_, 1.0 / r);
     }
@@ -64,7 +65,7 @@ public:
         switch (state_) {
         case ON:
             // Channel: current flows drain→source (positive for normal operation)
-            return vds / R_ON;
+            return vds / rOn_;
         case BODY_DIODE:
             // Body diode: current flows source→drain (negative Ids direction).
             // Clamp to negative-only: body diode cannot carry positive (forward) current.
@@ -112,7 +113,7 @@ private:
     bool justExitedBodyDiode_ = false;  // BODY_DIODE→OFF: block immediate re-entry
     bool flippedSinceSave_    = false;  // any state change since saveState (transient or persistent)
 
-    static constexpr double R_ON             = 1e-3;
+    double rOn_;                                       // user-settable channel ON resistance (Ω)
     static constexpr double BODY_R_ON        = 2e-3;
     static constexpr double R_OFF            = 1e9;
     static constexpr double V_GATE_THRESHOLD = 0.5;

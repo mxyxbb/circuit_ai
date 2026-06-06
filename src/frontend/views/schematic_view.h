@@ -23,6 +23,16 @@ public:
     // closeSchDoc on the model.
     int  takePendingCloseDoc() { int v = pendingCloseDocIdx_; pendingCloseDocIdx_ = -1; return v; }
 
+    // ── File-action API (callable from the main window menu) ──────────────────
+    // Each opens a native dialog if needed, then performs the action on the
+    // active schematic. Status messages surface on the schematic toolbar.
+    void fileSave(MainViewModel& vm);
+    void fileSaveAs(MainViewModel& vm);
+    void fileLoad(MainViewModel& vm);
+    void fileExportSvg(MainViewModel& vm);
+    void fileCopyImg(MainViewModel& vm);
+    float& svgExportScaleRef() { return svgExportScale_; }
+
 private:
     // ── Canvas pan / zoom ───────────────────────────────────────────────────
     ImVec2 panOffset_{200.0f, 150.0f};  // canvas-space translation
@@ -59,6 +69,12 @@ private:
     // ── Save / Load status ───────────────────────────────────────────────────
     char  ioStatus_[64] = {};
     float ioStatusTimer_ = 0.f;
+
+    // ── SVG export ───────────────────────────────────────────────────────────
+    // Scale factor applied to the SVG document size (the viewBox stays in canvas
+    // units so this is purely a "rendered size" multiplier; vector quality is
+    // unaffected). 1.0 ≈ 96 DPI screen rendering, 2.0 ≈ 192 DPI, 3.0 ≈ 288 DPI.
+    float svgExportScale_ = 2.0f;
     // Active doc's filePath, synced from MainViewModel each frame so existing
     // code (toolbar, status overlay, Ctrl+S handler) keeps working unchanged.
     std::string savedFilePath_;

@@ -7,6 +7,8 @@ add_library(circuit_frontend STATIC
     views/settings_view.cpp
     views/palette_view.cpp
     views/schematic_view.cpp
+    views/schematic_svg_export.cpp
+    views/schematic_clipboard_win32.cpp
     platform/file_dialog_win32.cpp
 )
 target_include_directories(circuit_frontend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

@@ -242,10 +242,20 @@ bool NetlistParser::processLine(const std::string& line, ParseResult& result) {
             return true;
         }
         case 'S': case 's': {
-            if (tokens.size() < 5) { result.error = "S: need drain source gate gateRef"; return false; }
+            if (tokens.size() < 5) { result.error = "S: need drain source gate gateRef [Ron=<v>]"; return false; }
             int nd = std::stoi(tokens[1]), ns = std::stoi(tokens[2]);
             int ng = std::stoi(tokens[3]), ngr = std::stoi(tokens[4]);
-            result.circuit.addComponent(std::make_unique<IdealSwitch>(name, nd, ns, ng, ngr));
+            double rOn = 1e-3;  // default 1 mΩ if Ron= not specified or invalid
+            for (size_t i = 5; i < tokens.size(); ++i) {
+                std::string p = toUpper(tokens[i]);
+                if (p.find("RON=") == 0) {
+                    double v = parseValue(p.substr(4));
+                    // Reject 0 / negative / non-finite -- they would yield Inf
+                    // conductance in stamp() and wreck the solve.
+                    if (std::isfinite(v) && v > 0.0) rOn = v;
+                }
+            }
+            result.circuit.addComponent(std::make_unique<IdealSwitch>(name, nd, ns, ng, ngr, rOn));
             return true;
         }
         default:

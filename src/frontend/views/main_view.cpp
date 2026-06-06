@@ -120,6 +120,29 @@ void MainView::render(MainViewModel& vm) {
 
     // Menu bar
     if (ImGui::BeginMenuBar()) {
+        // ── File menu (acts on the active schematic) ──────────────────────
+        if (ImGui::BeginMenu("File")) {
+#ifdef _WIN32
+            if (ImGui::MenuItem("Save", "Ctrl+S"))      schematicView_->fileSave(vm);
+            if (ImGui::MenuItem("Save As..."))          schematicView_->fileSaveAs(vm);
+            if (ImGui::MenuItem("Load..."))             schematicView_->fileLoad(vm);
+            ImGui::Separator();
+            if (ImGui::MenuItem("Export SVG..."))       schematicView_->fileExportSvg(vm);
+            if (ImGui::MenuItem("Copy IMG"))            schematicView_->fileCopyImg(vm);
+            ImGui::Separator();
+            ImGui::TextDisabled("Export scale");
+            ImGui::SetNextItemWidth(120.0f);
+            ImGui::DragFloat("##svgscale_main", &schematicView_->svgExportScaleRef(),
+                             0.1f, 0.5f, 10.0f, "%.1fx");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "Output size multiplier for Export SVG / Copy IMG.\n"
+                    "1.0x = canvas units; 2.0x ≈ 192-DPI feel.");
+#else
+            ImGui::TextDisabled("File ops are Windows-only.");
+#endif
+            ImGui::EndMenu();
+        }
         if (ImGui::BeginMenu("View")) {
             for (auto& sv : scopeViews_) {
                 bool vis = sv->isVisible();

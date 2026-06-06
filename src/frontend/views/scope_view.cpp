@@ -397,8 +397,13 @@ void ScopeView::render(MainViewModel& vm) {
         centerOnFirstRender_ = false;
         ImGuiWindowSettings* ws = ImGui::FindWindowSettingsByID(ImHashStr(title_.c_str()));
         if (!ws) {
+            // First-time render of a freshly created scope (no imgui.ini entry
+            // yet). Pick a comfortable default so the plot area is large enough
+            // for ImPlot's zoom drag / scroll-wheel zoom to register. The old
+            // default of 120x80 px squeezed the plot below ImPlot's interaction
+            // thresholds, making zoom appear broken on every new scope.
             ImGuiViewport* vp = ImGui::GetMainViewport();
-            ImVec2 sz = {120.0f, 80.0f};
+            ImVec2 sz = {720.0f, 460.0f};
             ImGui::SetNextWindowPos({
                 vp->WorkPos.x + (vp->WorkSize.x - sz.x) * 0.5f,
                 vp->WorkPos.y + (vp->WorkSize.y - sz.y) * 0.5f
