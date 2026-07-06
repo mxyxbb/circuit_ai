@@ -24,11 +24,23 @@ protected:
         //     floor(phase) returns k-1 instead of k, so frac never reaches 0.
         // Adding phaseEps to phase BEFORE floor lifts both cases above the FP
         // rounding margin, so the floor and frac come out matching the
-        // mathematical edge. The shift moves the apparent transition by
-        // phaseEps/freq = 1e-17 s for freq=100 kHz -- far below dt and physically
-        // irrelevant, but enough to absorb the ~5e-17 s rounding error.
-        constexpr double phaseEps = 1e-12;
-        double phase = (t - tdelay_) * freq_ + phaseEps;
+        // mathematical edge.
+        //
+        // phaseEps must be RELATIVE, not fixed: the rounding error of both this
+        // product and of the edge times returned by nextEventAfter() is a few
+        // ULP of `phase`, which grows with the cycle count k. A fixed 1e-12
+        // (~1 ULP at phase = 4096) silently stopped absorbing the error once
+        // t*freq exceeded ~2^12 cycles: at 1 MHz that is t > ~4 ms, after which
+        // edge evaluation at clipped step boundaries randomly returned the
+        // PRE-edge value. The missed edge then flips the switches one step
+        // late, mid-step, where ZC bisection collapses to its dt/256 floor and
+        // the 256x-stiffened inductor companion produces a several-hundred-volt
+        // single-sample spike (seen in hsc4816 from t = 7.8 ms onward).
+        // 1e-12 relative = ~4.5 ULP at any magnitude; the apparent edge shift
+        // is phase*1e-12/freq seconds = t*1e-12 -- always orders of magnitude
+        // below dt. The absolute 1e-12 floor covers t near zero.
+        double phase = (t - tdelay_) * freq_;
+        phase += phase * 1e-12 + 1e-12;
         double frac = phase - std::floor(phase);
         return (frac < duty_) ? vhigh_ : vlow_;
     }

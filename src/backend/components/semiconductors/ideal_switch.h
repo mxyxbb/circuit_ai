@@ -35,6 +35,7 @@ public:
             //   (a) not immediately after the channel just turned OFF (justFlippedOff_)
             //   (b) not if the body diode just exited in this same innerSolve (justExitedBodyDiode_)
             // Both flags are reset at saveState / restoreState so each innerSolve starts fresh.
+            //
             if (vds < -V_BD_THRESHOLD && !justFlippedOff_ && !justExitedBodyDiode_)
                 desired = BODY_DIODE;
             else

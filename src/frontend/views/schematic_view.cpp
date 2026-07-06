@@ -375,6 +375,98 @@ static void pushUndo(std::deque<SchematicModel>& undoStack,
         undoStack.pop_front();
 }
 
+// ── Welcome / empty-state screen ─────────────────────────────────────────
+// Shown when every schematic tab has been closed. No doc exists yet, so the
+// file counter isn't advanced until the user commits to a new schematic by
+// dropping a component or clicking "New Schematic".
+
+void SchematicView::createDocWithComp(MainViewModel& vm, const std::string& typeId,
+                                      ImVec2 canvasPos) {
+    // Leaving the welcome state: materialize the doc the user is populating.
+    vm.newSchDoc();
+    // Fresh canvas — clear any stale shared editor state.
+    selectedCompId_ = selectedWireId_ = propEditCompId_ = movingCompId_ = -1;
+    multiSelectedIds_.clear(); multiMoveOrigPos_.clear();
+    wiringActive_ = false;
+    undoStack_.clear(); redoStack_.clear();
+
+    SchematicModel& sch = vm.schematic();
+    if (typeId == "TXN_CUSTOM") {
+        // Custom transformer wizard (matches the canvas drop path).
+        txNPending_    = true;
+        txNPendingPos_ = canvasPos;
+        txNWindings_   = 2;
+        std::snprintf(txNGroupBuf_, sizeof(txNGroupBuf_), "TX%d",
+                      (int)sch.comps().size() + 1);
+        for (int i = 0; i < 6; ++i) std::snprintf(txNTurns_[i], 16, "%d", i == 0 ? 10 : 1);
+    } else if (!typeId.empty()) {
+        sch.addComp(typeId, canvasPos);
+    }
+}
+
+void SchematicView::renderWelcome(MainViewModel& vm) {
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    if (avail.x < 1.0f) avail.x = 1.0f;
+    if (avail.y < 1.0f) avail.y = 1.0f;
+
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(18, 22, 28, 255));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0.0f, 0.0f});
+    ImGui::BeginChild("##sch_welcome", avail, false,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
+
+    ImVec2 origin = ImGui::GetCursorScreenPos();
+
+    // Whole-area invisible button doubles as the DnD drop target: dropping a
+    // palette component here creates the first schematic and places it.
+    // AllowOverlap so the centered "New Schematic" button drawn on top of it
+    // still receives hover/click (otherwise this button claims HoveredId first).
+    ImGui::SetNextItemAllowOverlap();
+    ImGui::InvisibleButton("##welcome_ib", avail);
+    if (ImGui::BeginDragDropTarget()) {
+        if (const ImGuiPayload* pl = ImGui::AcceptDragDropPayload("COMP_TYPE")) {
+            std::string typeId(static_cast<const char*>(pl->Data));
+            ImVec2 dropCanvas = snapGrid(s2c(ImGui::GetMousePos(), origin));
+            createDocWithComp(vm, typeId, dropCanvas);
+        }
+        ImGui::EndDragDropTarget();
+    }
+
+    // ── Centered intro block (drawn on top of the invisible button) ──────────
+    auto centerLine = [&](const char* txt, ImU32 col, float scale) {
+        ImGui::SetWindowFontScale(scale);
+        float w = ImGui::CalcTextSize(txt).x;
+        ImGui::SetCursorPosX((avail.x - w) * 0.5f);
+        ImGui::PushStyleColor(ImGuiCol_Text, col);
+        ImGui::TextUnformatted(txt);
+        ImGui::PopStyleColor();
+        ImGui::SetWindowFontScale(1.0f);
+    };
+
+    ImGui::SetCursorPos({0.0f, avail.y * 0.26f});
+    centerLine("CircuitAI", IM_COL32(120, 175, 255, 255), 2.0f);
+    ImGui::Dummy({0, 6});
+    centerLine("Circuit Simulator", IM_COL32(140, 140, 140, 255), 1.0f);
+    ImGui::Dummy({0, 26});
+    centerLine("No schematic open.", IM_COL32(205, 205, 205, 255), 1.15f);
+    ImGui::Dummy({0, 14});
+    centerLine("Drag a component from the Palette onto this canvas to start a new schematic.",
+               IM_COL32(150, 150, 150, 255), 1.0f);
+    ImGui::Dummy({0, 2});
+    centerLine("Or open an existing .sch file from the File menu.",
+               IM_COL32(150, 150, 150, 255), 1.0f);
+    ImGui::Dummy({0, 22});
+
+    const float btnW = 200.0f;
+    ImGui::SetCursorPosX((avail.x - btnW) * 0.5f);
+    if (ImGui::Button("+ New Schematic", {btnW, 0.0f})) {
+        createDocWithComp(vm, "", {0.0f, 0.0f});  // empty doc, no component
+    }
+
+    ImGui::EndChild();
+}
+
 // ── Main render ────────────────────────────────────────────────────────────
 
 void SchematicView::render(MainViewModel& vm) {
@@ -427,6 +519,16 @@ void SchematicView::render(MainViewModel& vm) {
         return;
     }
     // (File operations now live in the main-window menu bar; see MainView.)
+
+    // ── Welcome / empty state ─────────────────────────────────────────────
+    // When every tab has been closed there is no active doc. Show a short intro
+    // instead of a blank grid, and only materialize a new doc once the user
+    // actually drops a component or clicks "New Schematic".
+    if (vm.schDocCount() == 0) {
+        renderWelcome(vm);
+        ImGui::End();
+        return;
+    }
 
     // ── Multi-doc tab bar ─────────────────────────────────────────────────
     {

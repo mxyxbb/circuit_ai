@@ -166,6 +166,13 @@ private:
     void drawRubberBand(ImDrawList* dl, MainViewModel& vm, ImVec2 origin) const;
     void renderProperties(MainViewModel& vm);
 
+    // Intro screen shown when no schematic doc is open (all tabs closed). Accepts
+    // a component drop / "New Schematic" click to create the first doc on demand,
+    // so the file counter isn't consumed just by closing and reopening tabs.
+    void renderWelcome(MainViewModel& vm);
+    // Shared helper: create a fresh doc and drop `typeId` onto it at `canvasPos`.
+    void createDocWithComp(MainViewModel& vm, const std::string& typeId, ImVec2 canvasPos);
+
     int  insertJunctionOnWire(struct SchematicModel& sch, int wireId, ImVec2 juncPos);
     static void drawDashedLine(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 col,
                                float thick, float dashLen, float gapLen);

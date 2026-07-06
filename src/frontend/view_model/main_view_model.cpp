@@ -84,8 +84,15 @@ void MainViewModel::closeSchDoc(int idx) {
 
     schDocs_.erase(schDocs_.begin() + idx);
     if (schDocs_.empty()) {
-        // Always keep at least one untitled doc so vm.schematic() is valid.
-        newSchDoc();
+        // No docs left → enter the "welcome" state. We deliberately do NOT create
+        // a fresh Untitled doc here: repeatedly closing tabs used to spawn
+        // Untitled-2, -3, … and bump the file counter for docs the user never
+        // touched. Instead SchematicView shows an intro screen while empty, and a
+        // new doc is created only when the user actually adds a component (see
+        // SchematicView::renderWelcome). Reset the counter so the next real doc
+        // starts cleanly at Untitled-1.
+        activeSchIdx_   = -1;
+        nextUntitledId_ = 1;
     } else {
         if (activeSchIdx_ >= (int)schDocs_.size()) activeSchIdx_ = (int)schDocs_.size() - 1;
         if (activeSchIdx_ < 0) activeSchIdx_ = 0;

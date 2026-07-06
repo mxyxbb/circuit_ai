@@ -294,6 +294,15 @@ bool Simulator::step() {
                 dtLo = dtMid;
         }
 
+        // If dtLo never moved off zero, every trial sub-step showed the state
+        // change — the change is active from the step START, not a mid-step
+        // crossing. Solving at the collapsed dtHi (= effDt/2^MAX_ZC_BISECT)
+        // would stiffen the reactive companion models by 2^MAX_ZC_BISECT and
+        // turn any residual inductor current into a several-hundred-volt
+        // single-sample spike. Solve the full step with BE instead — it
+        // absorbs the discontinuity the same way an event-boundary step does.
+        if (dtLo == 0.0) dtHi = effDt;
+
         // Final solve at dtHi: this is the step that includes the crossing.
         for (const auto& comp : circuit_->components()) {
             comp->restoreState();
