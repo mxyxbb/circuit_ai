@@ -1,10 +1,12 @@
 #include "view_model/schematic_model.h"
+#include "common/expr_eval.h"
 #include <algorithm>
 #include <sstream>
 #include <fstream>
 #include <set>
 #include <functional>
 #include <cmath>
+#include <cstdio>
 #include <unordered_map>
 
 // ── Static component type registry ───────────────────────────────────────────
@@ -207,12 +209,28 @@ void SchematicModel::removeWire(int id) {
 void SchematicModel::clear() {
     comps_.clear();
     wires_.clear();
+    variables_.clear();
     nextCompId_ = 1;
     nextWireId_ = 1;
     prefixCounts_.clear();
 }
 
-// ── Node map (union-find without SPICE output) ────────────────────────────────
+// ── User variables ────────────────────────────────────────────────────────────
+
+std::unordered_map<std::string,double> SchematicModel::variableMap() const {
+    std::unordered_map<std::string,double> map;
+    for (const auto& v : variables_) {
+        if (v.name.empty()) continue;
+        std::string key = v.name;
+        std::transform(key.begin(), key.end(), key.begin(), ::toupper);
+        double val;
+        if (exprv::tryEval(v.expr, &map, val))
+            map[key] = val;
+    }
+    return map;
+}
+
+// ── Node map (single source of truth for SPICE node numbering) ───────────────
 
 std::unordered_map<int,int> SchematicModel::computePinNodeMap() const {
     const int GND_KEY = -1;
@@ -257,6 +275,30 @@ std::unordered_map<int,int> SchematicModel::computePinNodeMap() const {
         }
     }
     int gndRoot = ufFind(GND_KEY);
+
+    // Count pins per net root so unconnected pins can be detected.
+    std::unordered_map<int,int> rootPinCount;
+    for (const auto& c : comps_) {
+        const CompTypeDef* td = findCompType(c.typeId);
+        if (!td) continue;
+        for (int i = 0; i < (int)td->pins.size(); ++i)
+            rootPinCount[ufFind(pinKey(c.id, i))]++;
+    }
+
+    // Implicit-ground rule for single-wire gate drives: a floating switch GRef
+    // pin or a floating voltage-source N pin is tied to node 0. This lets a
+    // standalone drive source connect to a MOSFET gate with one wire (V.P → S.G)
+    // — both return pins fall back to GND, closing the gate loop.
+    auto implicitGnd = [&](const SchematicComp& c, int pinIdx) -> bool {
+        bool candidate =
+            (c.typeId == "S" && pinIdx == 3) ||                       // GRef
+            ((c.typeId == "V_DC" || c.typeId == "V_SQUARE" ||
+              c.typeId == "V_SIN" || c.typeId == "V_STEP") && pinIdx == 1); // N
+        if (!candidate) return false;
+        int root = ufFind(pinKey(c.id, pinIdx));
+        return root != gndRoot && rootPinCount[root] == 1;
+    };
+
     std::unordered_map<int,int> rootToNet;
     rootToNet[gndRoot] = 0;
     int nextNet = 1;
@@ -266,6 +308,7 @@ std::unordered_map<int,int> SchematicModel::computePinNodeMap() const {
         if (!td) continue;
         for (int i = 0; i < (int)td->pins.size(); ++i) {
             int key = pinKey(c.id, i);
+            if (implicitGnd(c, i)) { result[key] = 0; continue; }
             int root = ufFind(key);
             auto it = rootToNet.find(root);
             int node;
@@ -282,76 +325,25 @@ std::unordered_map<int,int> SchematicModel::computePinNodeMap() const {
 std::string SchematicModel::generateNetlist(const SchematicSimConfig& cfg) const {
     if (comps_.empty()) return "";
 
-    // ── Union-Find (map-based, handles negative keys) ─────────────────────────
-    const int GND_KEY = -1;
-    std::unordered_map<int,int> ufp;  // parent map
-
-    std::function<int(int)> ufFind = [&](int x) -> int {
-        if (!ufp.count(x)) ufp[x] = x;
-        if (ufp.at(x) != x) ufp[x] = ufFind(ufp.at(x));  // path compression
-        return ufp.at(x);
-    };
-    auto ufUnite = [&](int a, int b) {
-        int ra = ufFind(a), rb = ufFind(b);
-        if (ra != rb) ufp[ra] = rb;
-    };
-
-    // Encode (compId, pinIdx) as a single int (each compId < 2^24, pinIdx < 64)
-    auto pinKey = [](int compId, int pinIdx) { return compId * 64 + pinIdx; };
-
-    // Initialise every pin vertex
-    for (const auto& c : comps_) {
-        const CompTypeDef* td = findCompType(c.typeId);
-        if (!td) continue;
-        for (int i = 0; i < (int)td->pins.size(); ++i)
-            ufFind(pinKey(c.id, i));
-    }
-
-    // GND symbols → unite with GND_KEY
-    for (const auto& c : comps_)
-        if (c.typeId == "GND") ufUnite(pinKey(c.id, 0), GND_KEY);
-
-    // Wires → unite connected pins
-    for (const auto& w : wires_)
-        ufUnite(pinKey(w.fromCompId, w.fromPinIdx),
-                pinKey(w.toCompId,   w.toPinIdx));
-
-    // NETLABEL → unite pins with same label text (global net shorthand)
-    {
-        std::unordered_map<std::string,int> labelKey;
-        for (const auto& c : comps_) {
-            if (c.typeId != "NETLABEL" || c.paramValues.empty()) continue;
-            int key = pinKey(c.id, 0);
-            auto it = labelKey.find(c.paramValues[0]);
-            if (it == labelKey.end()) labelKey[c.paramValues[0]] = key;
-            else ufUnite(key, it->second);
-        }
-    }
-
-    // Wire netNames → unite wires sharing the same user-assigned name
-    {
-        std::unordered_map<std::string,int> netKey;
-        for (const auto& w : wires_) {
-            if (w.netName.empty()) continue;
-            int key = pinKey(w.fromCompId, w.fromPinIdx);
-            auto it = netKey.find(w.netName);
-            if (it == netKey.end()) netKey[w.netName] = key;
-            else ufUnite(key, it->second);
-        }
-    }
-
-    // Assign net numbers: GND root → 0, rest → 1,2,3...
-    int gndRoot = ufFind(GND_KEY);
-    std::unordered_map<int,int> rootToNet;
-    rootToNet[gndRoot] = 0;
-    int nextNet = 1;
-
+    // Node numbering: shared with V-probe / net-name lookups so probe node
+    // numbers always match the netlist. Includes the implicit-ground rule for
+    // floating GRef / source-N pins (single-wire gate drives).
+    const std::unordered_map<int,int> nodeMap = computePinNodeMap();
     auto getNet = [&](int compId, int pinIdx) -> int {
-        int root = ufFind(pinKey(compId, pinIdx));
-        auto it = rootToNet.find(root);
-        if (it != rootToNet.end()) return it->second;
-        rootToNet[root] = nextNet++;
-        return rootToNet.at(root);
+        auto it = nodeMap.find(pinKey(compId, pinIdx));
+        return (it != nodeMap.end()) ? it->second : 0;
+    };
+
+    // Evaluate a numeric parameter (expressions + user variables + suffixes) to
+    // a plain literal. Unevaluable strings pass through unchanged so the
+    // backend's lenient fallback still sees the raw text.
+    const auto varMap = variableMap();
+    auto ev = [&](const std::string& s) -> std::string {
+        double v;
+        if (!exprv::tryEval(s, &varMap, v)) return s;
+        char buf[40];
+        std::snprintf(buf, sizeof(buf), "%.12g", v);
+        return std::string(buf);
     };
 
     // ── Generate SPICE text ───────────────────────────────────────────────────
@@ -359,6 +351,10 @@ std::string SchematicModel::generateNetlist(const SchematicSimConfig& cfg) const
     oss << "* Generated by CircuitAI Schematic\n";
 
     std::set<int> usedNets;
+    // Track nets only for pins that actually reach the SPICE output; a net used
+    // solely by helper symbols (lone JUNC/NETLABEL) must not be probed — its
+    // node number would not exist in the parsed circuit.
+    auto useNet = [&](int n) { if (n != 0) usedNets.insert(n); };
 
     for (const auto& comp : comps_) {
         if (comp.typeId == "GND") continue;
@@ -366,13 +362,9 @@ std::string SchematicModel::generateNetlist(const SchematicSimConfig& cfg) const
         const CompTypeDef* td = findCompType(comp.typeId);
         if (!td) continue;
 
-        // Collect nets and track which non-zero nets exist
         std::vector<int> nets;
-        for (int i = 0; i < (int)td->pins.size(); ++i) {
-            int n = getNet(comp.id, i);
-            nets.push_back(n);
-            if (n != 0) usedNets.insert(n);
-        }
+        for (int i = 0; i < (int)td->pins.size(); ++i)
+            nets.push_back(getNet(comp.id, i));
 
         // Helper: safe param access
         auto p = [&](int i) -> const std::string& {
@@ -382,30 +374,31 @@ std::string SchematicModel::generateNetlist(const SchematicSimConfig& cfg) const
         };
 
         const std::string& n = comp.instanceName;
+        bool emitted = true;
 
         if (comp.typeId == "R") {
-            oss << n << ' ' << nets[0] << ' ' << nets[1] << ' ' << p(0) << '\n';
+            oss << n << ' ' << nets[0] << ' ' << nets[1] << ' ' << ev(p(0)) << '\n';
         } else if (comp.typeId == "C") {
-            oss << n << ' ' << nets[0] << ' ' << nets[1] << ' ' << p(0) << '\n';
+            oss << n << ' ' << nets[0] << ' ' << nets[1] << ' ' << ev(p(0)) << '\n';
         } else if (comp.typeId == "L") {
-            oss << n << ' ' << nets[0] << ' ' << nets[1] << ' ' << p(0) << '\n';
+            oss << n << ' ' << nets[0] << ' ' << nets[1] << ' ' << ev(p(0)) << '\n';
         } else if (comp.typeId == "V_DC") {
-            oss << n << ' ' << nets[0] << ' ' << nets[1] << " DC " << p(0) << '\n';
+            oss << n << ' ' << nets[0] << ' ' << nets[1] << " DC " << ev(p(0)) << '\n';
         } else if (comp.typeId == "V_SQUARE") {
             oss << n << ' ' << nets[0] << ' ' << nets[1]
-                << " SQUARE freq=" << p(0) << " duty=" << p(1)
-                << " Vhigh=" << p(2) << " Vlow=" << p(3)
-                << " tdelay=" << p(4) << '\n';
+                << " SQUARE freq=" << ev(p(0)) << " duty=" << ev(p(1))
+                << " Vhigh=" << ev(p(2)) << " Vlow=" << ev(p(3))
+                << " tdelay=" << ev(p(4)) << '\n';
         } else if (comp.typeId == "V_SIN") {
             oss << n << ' ' << nets[0] << ' ' << nets[1]
-                << " SIN freq=" << p(0) << " vampl=" << p(1)
-                << " voff=" << p(2) << '\n';
+                << " SIN freq=" << ev(p(0)) << " vampl=" << ev(p(1))
+                << " voff=" << ev(p(2)) << '\n';
         } else if (comp.typeId == "V_STEP") {
             oss << n << ' ' << nets[0] << ' ' << nets[1]
-                << " STEP V0=" << p(0) << " V1=" << p(1)
-                << " tdelay=" << p(2) << '\n';
+                << " STEP V0=" << ev(p(0)) << " V1=" << ev(p(1))
+                << " tdelay=" << ev(p(2)) << '\n';
         } else if (comp.typeId == "I") {
-            oss << n << ' ' << nets[0] << ' ' << nets[1] << " DC " << p(0) << '\n';
+            oss << n << ' ' << nets[0] << ' ' << nets[1] << " DC " << ev(p(0)) << '\n';
         } else if (comp.typeId == "D") {
             oss << n << ' ' << nets[0] << ' ' << nets[1] << '\n';
         } else if (comp.typeId == "S") {
@@ -416,18 +409,20 @@ std::string SchematicModel::generateNetlist(const SchematicSimConfig& cfg) const
             // falls back to its 1 mΩ default otherwise.
             oss << n << ' ' << nets[0] << ' ' << nets[1]
                 << ' ' << nets[2] << ' ' << nets[3];
-            if (!p(0).empty()) oss << " Ron=" << p(0);
+            if (!p(0).empty()) oss << " Ron=" << ev(p(0));
             oss << '\n';
         } else if (comp.typeId == "TX") {
             oss << n << ' ' << nets[0] << ' ' << nets[1]
                 << ' ' << nets[2] << ' ' << nets[3]
-                << " turns1=" << p(0) << " turns2=" << p(1) << '\n';
+                << " turns1=" << ev(p(0)) << " turns2=" << ev(p(1)) << '\n';
         } else if (comp.typeId == "TX3") {
             oss << n << ' ' << nets[0] << ' ' << nets[1]
                 << ' ' << nets[2] << ' ' << nets[3]
                 << ' ' << nets[4] << ' ' << nets[5]
-                << " turns1=" << p(0) << " turns2=" << p(1) << " turns3=" << p(2) << '\n';
+                << " turns1=" << ev(p(0)) << " turns2=" << ev(p(1))
+                << " turns3=" << ev(p(2)) << '\n';
         } else if (comp.typeId == "TX_CORE") {
+            emitted = false;
             if (comp.paramValues.empty()) continue;
             const std::string& grp = comp.paramValues[0];
             // Collect TX_WIND components belonging to this group, sorted by windingIdx
@@ -444,21 +439,27 @@ std::string SchematicModel::generateNetlist(const SchematicSimConfig& cfg) const
                 return ai < bi;
             });
             oss << n;
-            for (const auto* wc : winds)
-                oss << ' ' << getNet(wc->id, 0) << ' ' << getNet(wc->id, 1);
+            for (const auto* wc : winds) {
+                int np = getNet(wc->id, 0), nn = getNet(wc->id, 1);
+                oss << ' ' << np << ' ' << nn;
+                useNet(np); useNet(nn);
+            }
             for (int wi = 0; wi < (int)winds.size(); ++wi) {
                 const std::string& t = (winds[wi]->paramValues.size() > 2)
                     ? winds[wi]->paramValues[2] : "1";
-                oss << " turns" << (wi+1) << '=' << t;
+                oss << " turns" << (wi+1) << '=' << ev(t);
             }
             oss << '\n';
-        } else if (comp.typeId == "TX_WIND"   || comp.typeId == "JUNC" ||
-                   comp.typeId == "NETLABEL"   || comp.typeId == "TXN_CUSTOM") {
-            // No direct SPICE output for these helper types
+        } else {
+            // Helper types (TX_WIND, JUNC, NETLABEL, TXN_CUSTOM): no SPICE output
+            emitted = false;
         }
+
+        if (emitted)
+            for (int nn : nets) useNet(nn);
     }
 
-    oss << ".TRAN " << cfg.dt << ' ' << cfg.tEnd << '\n';
+    oss << ".TRAN " << ev(cfg.dt) << ' ' << ev(cfg.tEnd) << '\n';
     // Probe all node voltages
     for (int net : usedNets)
         oss << ".PROBE V(" << net << ")\n";
@@ -507,6 +508,12 @@ bool SchematicModel::saveToFile(const std::string& path) const {
 
     f << "CSCH3\n";
     f << "S " << simCfg.dt << ' ' << simCfg.tEnd << '\n';
+
+    // User variables: "P <name> <expr>" (expr may contain spaces).
+    // Older loaders skip unknown tags, so this stays CSCH3-compatible.
+    for (const auto& v : variables_)
+        if (!v.name.empty())
+            f << "P " << v.name << ' ' << v.expr << '\n';
 
     for (const auto& c : comps_) {
         f << 'C' << ' ' << c.id << ' ' << c.typeId << ' ' << c.instanceName
@@ -558,7 +565,16 @@ bool SchematicModel::loadFromFile(const std::string& path) {
         char tag;
         ss >> tag;
 
-        if (tag == 'S') {
+        if (tag == 'P') {
+            SchematicVar v;
+            if (!(ss >> v.name)) continue;
+            std::string rest;
+            if (std::getline(ss, rest)) {
+                size_t s = rest.find_first_not_of(" \t");
+                if (s != std::string::npos) v.expr = rest.substr(s);
+            }
+            variables_.push_back(std::move(v));
+        } else if (tag == 'S') {
             std::string dt, tEnd;
             if (ss >> dt >> tEnd) {
                 std::strncpy(simCfg.dt,   dt.c_str(),   sizeof(simCfg.dt)   - 1);

@@ -58,6 +58,25 @@ private:
     int  wireFromPinIdx_ = -1;
     std::vector<ImVec2> wireWaypoints_;  // intermediate points accumulated during wiring
 
+    // ── Clipboard (Ctrl+C stores, Ctrl+V places) ────────────────────────────
+    std::vector<SchematicComp> clipComps_;   // snapshot of copied components
+    std::vector<SchematicWire> clipWires_;   // wires fully inside the copied set
+    ImVec2 clipRefPos_{0, 0};                // reference point for paste placement
+
+    // ── Ctrl-drag duplicate ──────────────────────────────────────────────────
+    bool   ctrlDragPending_ = false;  // Ctrl-pressed on an already-selected comp
+    int    ctrlDragCompId_  = -1;
+    ImVec2 ctrlDragStart_{0, 0};
+
+    // ── Wire segment dragging (reroute) ──────────────────────────────────────
+    int    wireDragId_     = -1;      // wire whose segment was pressed (-1 = none)
+    int    wireDragSeg_    = -1;      // segment index in [pinA, wps..., pinB] path
+    bool   wireDragActive_ = false;   // armed → active after movement threshold
+    bool   wireDragVert_   = false;   // vertical segment → drag along X
+    int    wireDragWpA_    = -1;      // waypoint indices of the dragged segment
+    int    wireDragWpB_    = -1;
+    ImVec2 wireDragStartPt_{0, 0};
+
     // ── Panning (right-mouse) ────────────────────────────────────────────────
     bool panningActive_ = false;
 
@@ -65,6 +84,10 @@ private:
     int  propEditCompId_ = -1;
     char propNameBuf_[64]  = {};
     char propBufs_[8][64]  = {};    // up to 8 params per component
+
+    // ── Variables editor ─────────────────────────────────────────────────────
+    bool varsWindowOpen_ = false;
+    void renderVariablesWindow(MainViewModel& vm);
 
     // ── Save / Load status ───────────────────────────────────────────────────
     char  ioStatus_[64] = {};

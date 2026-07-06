@@ -2,6 +2,7 @@
 #include "circuit/circuit.h"
 #include "common/sim_types.h"
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 struct ParseResult {
@@ -20,8 +21,15 @@ public:
 
 private:
     bool processLine(const std::string& line, ParseResult& result);
+    // Evaluates s as an arithmetic expression (with SPICE magnitude suffixes
+    // and .PARAM variables); falls back to lenient "number + suffix" parsing
+    // for backward compatibility. Returns 0.0 if nothing parses.
     double parseValue(const std::string& s);
     std::string toUpper(std::string s);
+
+    // .PARAM name=expr definitions, usable in any subsequent value expression.
+    // Keys stored uppercase (netlists are case-insensitive).
+    std::unordered_map<std::string, double> params_;
 
     // Parsing .PROBE entries like V(1), I(R1)
     bool parseProbe(const std::string& token, ParseResult& result);

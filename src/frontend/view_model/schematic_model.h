@@ -56,6 +56,12 @@ struct SchematicSimConfig {
     char tEnd[32] = "0.01";
 };
 
+// ── User-defined variable (usable in any numeric parameter expression) ───────
+struct SchematicVar {
+    std::string name;   // identifier, case-insensitive ([A-Za-z_][A-Za-z0-9_]*)
+    std::string expr;   // expression; may reference variables defined above it
+};
+
 // ── Top-level schematic model ─────────────────────────────────────────────────
 class SchematicModel {
 public:
@@ -88,9 +94,18 @@ public:
     // SPICE netlist generation — returns "" if schematic is empty
     std::string generateNetlist(const SchematicSimConfig& cfg) const;
 
-    // Returns pinKey(compId,pinIdx) → SPICE net number (same logic as generateNetlist)
+    // Returns pinKey(compId,pinIdx) → SPICE net number. Single source of truth
+    // for node numbering — generateNetlist uses this same map, so probe node
+    // numbers always agree with the emitted netlist.
     std::unordered_map<int,int> computePinNodeMap() const;
     static int pinKey(int compId, int pinIdx) { return compId * 64 + pinIdx; }
+
+    // ── User variables ────────────────────────────────────────────────────────
+    std::vector<SchematicVar>&       variables()       { return variables_; }
+    const std::vector<SchematicVar>& variables() const { return variables_; }
+    // Evaluate all variables in definition order. Keys are UPPERCASE names.
+    // Variables whose expression fails to evaluate are omitted.
+    std::unordered_map<std::string,double> variableMap() const;
 
     // Returns the user-assigned netName for a given SPICE node ID (empty if none).
     std::string getNetNameForNode(int nodeId) const;
@@ -108,6 +123,7 @@ public:
 private:
     std::vector<SchematicComp> comps_;
     std::vector<SchematicWire> wires_;
+    std::vector<SchematicVar>  variables_;
     int nextCompId_ = 1;
     int nextWireId_ = 1;
     std::unordered_map<std::string, int> prefixCounts_; // prefix -> count

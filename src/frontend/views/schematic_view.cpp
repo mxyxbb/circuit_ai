@@ -20,10 +20,12 @@
 #include "view_model/scope_model.h"
 #include "view_model/schematic_model.h"
 #include "platform/file_dialog.h"
+#include "common/expr_eval.h"
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <cmath>
 #include <cctype>
+#include <cfloat>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -93,6 +95,14 @@ float SchematicView::distPointToSegment(ImVec2 pt, ImVec2 a, ImVec2 b) {
     ImVec2 closest = {a.x + t*ab.x, a.y + t*ab.y};
     ImVec2 diff = {pt.x - closest.x, pt.y - closest.y};
     return sqrtf(diff.x*diff.x + diff.y*diff.y);
+}
+
+// Auto corner: when a wire segment from → to is diagonal, insert the Manhattan
+// corner point (horizontal-first, matching the rubber-band preview) so routed
+// wires always stay orthogonal.
+static void appendManhattanCorner(std::vector<ImVec2>& wps, ImVec2 from, ImVec2 to) {
+    if (std::fabs(from.x - to.x) > 0.5f && std::fabs(from.y - to.y) > 0.5f)
+        wps.push_back({to.x, from.y});
 }
 
 // ── Coordinate transforms ──────────────────────────────────────────────────
@@ -521,6 +531,15 @@ void SchematicView::render(MainViewModel& vm) {
     ImGui::SetNextItemWidth(80.0f);
     ImGui::InputText("##schtend", sch.simCfg.tEnd, sizeof(sch.simCfg.tEnd));
     ImGui::SameLine();
+    {
+        bool active = varsWindowOpen_;
+        if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f,0.5f,0.7f,1.0f));
+        if (ImGui::SmallButton("Vars")) varsWindowOpen_ = !varsWindowOpen_;
+        if (active) ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("User variables usable in any numeric field, e.g. fsw=1e6 then tdelay=0.5/fsw");
+    }
+    ImGui::SameLine();
     ImGui::TextDisabled("|");
     ImGui::SameLine();
     // Probe buttons
@@ -551,7 +570,7 @@ void SchematicView::render(MainViewModel& vm) {
     } else if (probeMode_ == PM_IProbe) {
         ImGui::TextColored({0.3f,1.0f,0.3f,1.0f}, "[I-PROBE — click a pin to add its current to selected Scope plot]");
     } else {
-        ImGui::TextDisabled("LClick=sel/wire  R=rotate  X=mirror  Ctrl+C=copy  RDrag=pan  Scroll=zoom  Del=delete  LDrag=multisel  Ctrl+LClick=add sel  DblClick wire=net name");
+        ImGui::TextDisabled("LClick=sel/wire  R=rotate  X=mirror  Ctrl+C/V=copy/paste  Ctrl+drag sel=duplicate  Drag wire=reroute  RDrag=pan  Del=delete  LDrag=multisel  DblClick wire=net name");
     }
     ImGui::Separator();
 
@@ -643,6 +662,7 @@ void SchematicView::render(MainViewModel& vm) {
     ImGui::EndChild();
 
     renderProperties(vm);
+    renderVariablesWindow(vm);
 
     // ── Wire net name edit popup ─────────────────────────────────────────
     if (editNetWireId_ >= 0) ImGui::OpenPopup("Net Name##wireDlg");
@@ -819,49 +839,65 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
         propEditCompId_ = -1;
     }
 
-    // ── Ctrl+C: copy selected component(s) ────────────────────────────────
+    // ── Ctrl+C: store selection in the schematic clipboard ─────────────────
+    // (placement happens on Ctrl+V — nothing is added to the canvas here)
     if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C)) {
         std::vector<int> toCopy = multiSelectedIds_.empty()
             ? std::vector<int>{selectedCompId_} : multiSelectedIds_;
         toCopy.erase(std::remove(toCopy.begin(), toCopy.end(), -1), toCopy.end());
-        if (!toCopy.empty()) {
-            pushUndo(undoStack_, redoStack_, sch, kMaxUndo);
-            std::unordered_map<int,int> idMap;
-            std::vector<int> newIds;
-            for (int cid : toCopy) {
-                SchematicComp* src = sch.findComp(cid);
-                if (!src) continue;
-                // Save before addComp — vector reallocation invalidates src pointer
-                std::string srcTypeId   = src->typeId;
-                ImVec2      srcPos      = src->pos;
-                int         srcRot      = src->rotation;
-                bool        srcMirrorX  = src->mirrorX;
-                auto        srcParams   = src->paramValues;
-                ImVec2 newPos = snapGrid({srcPos.x + 40.f, srcPos.y + 40.f});
-                int newId = sch.addComp(srcTypeId, newPos);
-                SchematicComp* dst = sch.findComp(newId);
-                if (dst) {
-                    dst->rotation    = srcRot;
-                    dst->mirrorX     = srcMirrorX;
-                    dst->paramValues = srcParams;
-                }
-                idMap[cid] = newId;
-                newIds.push_back(newId);
+        std::vector<SchematicComp> snap;
+        std::unordered_set<int> ids;
+        for (int cid : toCopy) {
+            if (const SchematicComp* src = sch.findComp(cid)) {
+                snap.push_back(*src);
+                ids.insert(cid);
             }
-            // Copy wires connecting two copied components (shift waypoints by same offset)
-            auto wireSnap = sch.wires();
-            for (const auto& w : wireSnap) {
-                if (idMap.count(w.fromCompId) && idMap.count(w.toCompId)) {
-                    std::vector<ImVec2> shiftedWps;
-                    shiftedWps.reserve(w.waypoints.size());
-                    for (const auto& wp : w.waypoints)
-                        shiftedWps.push_back({wp.x + 40.f, wp.y + 40.f});
-                    sch.addWire(idMap[w.fromCompId], w.fromPinIdx,
-                                idMap[w.toCompId],   w.toPinIdx, shiftedWps);
-                }
+        }
+        if (!snap.empty()) {
+            clipComps_ = std::move(snap);
+            clipWires_.clear();
+            for (const auto& w : sch.wires())
+                if (ids.count(w.fromCompId) && ids.count(w.toCompId))
+                    clipWires_.push_back(w);
+            clipRefPos_ = clipComps_[0].pos;   // paste anchors on the first comp
+        }
+    }
+
+    // ── Ctrl+V: place the clipboard content ────────────────────────────────
+    // Pastes at the mouse cursor when it hovers the canvas; otherwise offsets
+    // the original location by one grid cell so the copy stays visible.
+    if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_V) && !clipComps_.empty()) {
+        ImVec2 target = hovered ? snapGrid(mousePt)
+                                : ImVec2{clipRefPos_.x + 40.f, clipRefPos_.y + 40.f};
+        ImVec2 delta = { snapGrid({target.x - clipRefPos_.x, target.y - clipRefPos_.y}).x,
+                         snapGrid({target.x - clipRefPos_.x, target.y - clipRefPos_.y}).y };
+        pushUndo(undoStack_, redoStack_, sch, kMaxUndo);
+        std::unordered_map<int,int> idMap;
+        std::vector<int> newIds;
+        for (const auto& src : clipComps_) {
+            int newId = sch.addComp(src.typeId, snapGrid({src.pos.x + delta.x,
+                                                          src.pos.y + delta.y}));
+            if (newId < 0) continue;
+            if (SchematicComp* dst = sch.findComp(newId)) {
+                dst->rotation    = src.rotation;
+                dst->mirrorX     = src.mirrorX;
+                dst->paramValues = src.paramValues;
             }
+            idMap[src.id] = newId;
+            newIds.push_back(newId);
+        }
+        for (const auto& w : clipWires_) {
+            if (!idMap.count(w.fromCompId) || !idMap.count(w.toCompId)) continue;
+            std::vector<ImVec2> shifted;
+            shifted.reserve(w.waypoints.size());
+            for (const auto& wp : w.waypoints)
+                shifted.push_back({wp.x + delta.x, wp.y + delta.y});
+            sch.addWire(idMap.at(w.fromCompId), w.fromPinIdx,
+                        idMap.at(w.toCompId),   w.toPinIdx, shifted);
+        }
+        if (!newIds.empty()) {
             if (newIds.size() == 1) {
-                selectedCompId_  = newIds[0];
+                selectedCompId_ = newIds[0];
                 multiSelectedIds_.clear();
             } else {
                 multiSelectedIds_ = newIds;
@@ -1159,6 +1195,12 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
                     if (wiringActive_) {
                         if (comp.id != wireFromCompId_ || pi != wireFromPinIdx_) {
                             pushUndo(undoStack_, redoStack_, sch, kMaxUndo);
+                            ImVec2 endPos = pinCanvasPos(comp, pi);
+                            const SchematicComp* fromC = sch.findComp(wireFromCompId_);
+                            ImVec2 last = wireWaypoints_.empty()
+                                ? (fromC ? pinCanvasPos(*fromC, wireFromPinIdx_) : endPos)
+                                : wireWaypoints_.back();
+                            appendManhattanCorner(wireWaypoints_, last, endPos);
                             sch.addWire(wireFromCompId_, wireFromPinIdx_, comp.id, pi, wireWaypoints_);
                         }
                         wiringActive_ = false; wireFromCompId_ = -1; wireWaypoints_.clear();
@@ -1214,13 +1256,26 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
             }
             if (hitWireId >= 0) {
                 pushUndo(undoStack_, redoStack_, sch, kMaxUndo);
+                // Resolve start-pin position BEFORE insertJunctionOnWire — it
+                // adds a comp and may reallocate the comps vector.
+                const SchematicComp* fromC = sch.findComp(wireFromCompId_);
+                ImVec2 last = wireWaypoints_.empty()
+                    ? (fromC ? pinCanvasPos(*fromC, wireFromPinIdx_) : hitWireSnap)
+                    : wireWaypoints_.back();
                 int juncId = insertJunctionOnWire(sch, hitWireId, hitWireSnap);
                 if (juncId >= 0) {
+                    appendManhattanCorner(wireWaypoints_, last, hitWireSnap);
                     sch.addWire(wireFromCompId_, wireFromPinIdx_, juncId, 0, wireWaypoints_);
                     wiringActive_ = false; wireFromCompId_ = -1; wireWaypoints_.clear();
                 }
             } else {
-                wireWaypoints_.push_back(snapGrid(mousePt));
+                ImVec2 tgt = snapGrid(mousePt);
+                const SchematicComp* fromC = sch.findComp(wireFromCompId_);
+                ImVec2 last = wireWaypoints_.empty()
+                    ? (fromC ? pinCanvasPos(*fromC, wireFromPinIdx_) : tgt)
+                    : wireWaypoints_.back();
+                appendManhattanCorner(wireWaypoints_, last, tgt);
+                wireWaypoints_.push_back(tgt);
             }
         }
 
@@ -1256,20 +1311,26 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
                     wireWaypoints_.clear();
 
                     if (ImGui::GetIO().KeyCtrl) {
-                        // Ctrl+click: toggle in multi-select without starting move.
-                        // On first Ctrl+click, also include the previously single-selected comp.
-                        if (selectedCompId_ != -1 && multiSelectedIds_.empty())
-                            multiSelectedIds_.push_back(selectedCompId_);
-                        auto it = std::find(multiSelectedIds_.begin(), multiSelectedIds_.end(), comp.id);
-                        if (it != multiSelectedIds_.end()) {
-                            multiSelectedIds_.erase(it);
-                            if (selectedCompId_ == comp.id)
-                                selectedCompId_ = multiSelectedIds_.empty() ? -1 : multiSelectedIds_[0];
+                        bool alreadySel = (comp.id == selectedCompId_) ||
+                            std::find(multiSelectedIds_.begin(), multiSelectedIds_.end(), comp.id)
+                                != multiSelectedIds_.end();
+                        if (alreadySel) {
+                            // Ctrl-press on a selected comp: decide on release —
+                            // drag past the threshold duplicates the selection,
+                            // a plain release keeps the old toggle-out behavior.
+                            ctrlDragPending_ = true;
+                            ctrlDragCompId_  = comp.id;
+                            ctrlDragStart_   = mousePt;
                         } else {
+                            // Ctrl+click on an unselected comp: add to multi-select.
+                            // On first Ctrl+click, also include the previously
+                            // single-selected comp.
+                            if (selectedCompId_ != -1 && multiSelectedIds_.empty())
+                                multiSelectedIds_.push_back(selectedCompId_);
                             multiSelectedIds_.push_back(comp.id);
                             selectedCompId_ = comp.id;
+                            propEditCompId_ = -1;
                         }
-                        propEditCompId_ = -1;
                     } else {
                         // Normal click: if already in multi-select, start multi-move
                         bool inMulti = !multiSelectedIds_.empty() &&
@@ -1324,6 +1385,7 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
             float wireHitR = 6.0f / zoom_;
             float bestDist = wireHitR;
             int bestWireId = -1;
+            int bestSeg    = -1;
             for (const auto& wire : sch.wires()) {
                 const SchematicComp* ca = sch.findComp(wire.fromCompId);
                 const SchematicComp* cb = sch.findComp(wire.toCompId);
@@ -1336,7 +1398,7 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
                 path.push_back(pb);
                 for (size_t i = 1; i < path.size(); ++i) {
                     float d = distPointToSegment(mousePt, path[i-1], path[i]);
-                    if (d < bestDist) { bestDist = d; bestWireId = wire.id; }
+                    if (d < bestDist) { bestDist = d; bestWireId = wire.id; bestSeg = (int)i - 1; }
                 }
             }
             if (bestWireId != -1) {
@@ -1344,6 +1406,12 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
                 selectedCompId_   = -1;
                 multiSelectedIds_.clear();
                 propEditCompId_   = -1;
+                // Arm segment dragging; it activates once the mouse moves past
+                // a small threshold (so plain clicks / double-clicks still work).
+                wireDragId_      = bestWireId;
+                wireDragSeg_     = bestSeg;
+                wireDragActive_  = false;
+                wireDragStartPt_ = mousePt;
                 // Double-click on wire → open net name editor
                 if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
                     editNetWireId_ = bestWireId;
@@ -1416,6 +1484,174 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
             multiSelectedIds_.clear();
         }
         selBoxActive_ = false;
+    }
+
+    // ── Wire segment drag: shift an orthogonal segment perpendicular ───────
+    if (wireDragId_ != -1) {
+        SchematicWire* w = sch.findWire(wireDragId_);
+        const SchematicComp* ca = w ? sch.findComp(w->fromCompId) : nullptr;
+        const SchematicComp* cb = w ? sch.findComp(w->toCompId)   : nullptr;
+        if (!w || !ca || !cb) {
+            wireDragId_ = -1; wireDragActive_ = false;
+        } else if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            if (!wireDragActive_) {
+                float ddx = mousePt.x - wireDragStartPt_.x;
+                float ddy = mousePt.y - wireDragStartPt_.y;
+                if (ddx*ddx + ddy*ddy > 25.0f) {   // ~5 canvas px
+                    ImVec2 pinA = pinCanvasPos(*ca, w->fromPinIdx);
+                    ImVec2 pinB = pinCanvasPos(*cb, w->toPinIdx);
+                    std::vector<ImVec2> path;
+                    path.push_back(pinA);
+                    for (const auto& wp : w->waypoints) path.push_back(wp);
+                    path.push_back(pinB);
+                    int s = wireDragSeg_;
+                    if (s < 0 || s + 1 >= (int)path.size()) {
+                        wireDragId_ = -1;
+                    } else {
+                        ImVec2 a = path[s], b = path[s+1];
+                        bool vert  = std::fabs(a.x-b.x) <  0.5f && std::fabs(a.y-b.y) >= 0.5f;
+                        bool horiz = std::fabs(a.y-b.y) <  0.5f && std::fabs(a.x-b.x) >= 0.5f;
+                        if (!vert && !horiz) {
+                            wireDragId_ = -1;   // diagonal / zero-length: not draggable
+                        } else {
+                            pushUndo(undoStack_, redoStack_, sch, kMaxUndo);
+                            // Segment ends attached to pins can't move — insert
+                            // waypoint copies of the pin positions so the dragged
+                            // segment always sits between two waypoints.
+                            int N = (int)w->waypoints.size();
+                            if (s == 0) { w->waypoints.insert(w->waypoints.begin(), pinA); s = 1; N++; }
+                            if (s == N) { w->waypoints.push_back(pinB); N++; }
+                            wireDragWpA_    = s - 1;
+                            wireDragWpB_    = s;
+                            wireDragVert_   = vert;
+                            wireDragActive_ = true;
+                        }
+                    }
+                }
+            }
+            if (wireDragActive_ && wireDragWpA_ >= 0 &&
+                wireDragWpB_ < (int)w->waypoints.size()) {
+                if (wireDragVert_) {
+                    float nx = snapGrid({mousePt.x, 0.f}).x;
+                    w->waypoints[wireDragWpA_].x = nx;
+                    w->waypoints[wireDragWpB_].x = nx;
+                } else {
+                    float ny = snapGrid({0.f, mousePt.y}).y;
+                    w->waypoints[wireDragWpA_].y = ny;
+                    w->waypoints[wireDragWpB_].y = ny;
+                }
+            }
+        } else {
+            // Release: simplify the polyline — drop zero-length segments and
+            // collinear midpoints left over from dragging.
+            if (wireDragActive_) {
+                ImVec2 pinA = pinCanvasPos(*ca, w->fromPinIdx);
+                ImVec2 pinB = pinCanvasPos(*cb, w->toPinIdx);
+                std::vector<ImVec2> path;
+                path.push_back(pinA);
+                for (const auto& wp : w->waypoints) path.push_back(wp);
+                path.push_back(pinB);
+                std::vector<ImVec2> out;
+                out.push_back(path.front());
+                for (size_t i = 1; i + 1 < path.size(); ++i) {
+                    ImVec2 prev = out.back(), cur = path[i], nxt = path[i+1];
+                    bool dupPrev = std::fabs(cur.x-prev.x) < 0.5f && std::fabs(cur.y-prev.y) < 0.5f;
+                    bool collin  = (std::fabs(prev.x-cur.x) < 0.5f && std::fabs(cur.x-nxt.x) < 0.5f) ||
+                                   (std::fabs(prev.y-cur.y) < 0.5f && std::fabs(cur.y-nxt.y) < 0.5f);
+                    if (dupPrev || collin) continue;
+                    out.push_back(cur);
+                }
+                w->waypoints.assign(out.begin() + 1, out.end());
+            }
+            wireDragId_ = -1; wireDragActive_ = false;
+            wireDragWpA_ = wireDragWpB_ = -1;
+        }
+    }
+
+    // ── Ctrl-drag duplicate: resolve the pending Ctrl-press ────────────────
+    if (ctrlDragPending_) {
+        if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            // Plain Ctrl+click on a selected comp → toggle it OUT of the selection
+            if (selectedCompId_ != -1 && multiSelectedIds_.empty())
+                multiSelectedIds_.push_back(selectedCompId_);
+            auto it = std::find(multiSelectedIds_.begin(), multiSelectedIds_.end(),
+                                ctrlDragCompId_);
+            if (it != multiSelectedIds_.end()) {
+                multiSelectedIds_.erase(it);
+                if (selectedCompId_ == ctrlDragCompId_)
+                    selectedCompId_ = multiSelectedIds_.empty() ? -1 : multiSelectedIds_[0];
+            }
+            if (multiSelectedIds_.size() == 1) {
+                selectedCompId_ = multiSelectedIds_[0];
+                multiSelectedIds_.clear();
+            }
+            propEditCompId_  = -1;
+            ctrlDragPending_ = false;
+        } else {
+            float ddx = mousePt.x - ctrlDragStart_.x;
+            float ddy = mousePt.y - ctrlDragStart_.y;
+            if (ddx*ddx + ddy*ddy > 36.0f) {   // ~6 canvas px: it's a drag
+                // Duplicate the whole selection in place and hand the copies to
+                // the regular move logic — they follow the cursor from here on.
+                std::vector<int> ids = multiSelectedIds_.empty()
+                    ? std::vector<int>{selectedCompId_} : multiSelectedIds_;
+                ids.erase(std::remove(ids.begin(), ids.end(), -1), ids.end());
+                if (!ids.empty()) {
+                    pushUndo(undoStack_, redoStack_, sch, kMaxUndo);
+                    std::unordered_set<int> srcSet(ids.begin(), ids.end());
+                    std::unordered_map<int,int> idMap;
+                    std::vector<int> newIds;
+                    for (int cid : ids) {
+                        const SchematicComp* src = sch.findComp(cid);
+                        if (!src) continue;
+                        // Copy fields before addComp — reallocation invalidates src
+                        std::string typeId = src->typeId;
+                        ImVec2      pos    = src->pos;
+                        int         rot    = src->rotation;
+                        bool        mirror = src->mirrorX;
+                        auto        params = src->paramValues;
+                        int newId = sch.addComp(typeId, pos);
+                        if (newId < 0) continue;
+                        if (SchematicComp* dst = sch.findComp(newId)) {
+                            dst->rotation    = rot;
+                            dst->mirrorX     = mirror;
+                            dst->paramValues = params;
+                        }
+                        idMap[cid] = newId;
+                        newIds.push_back(newId);
+                    }
+                    for (const auto& w : std::vector<SchematicWire>(sch.wires())) {
+                        if (srcSet.count(w.fromCompId) && srcSet.count(w.toCompId) &&
+                            idMap.count(w.fromCompId) && idMap.count(w.toCompId))
+                            sch.addWire(idMap.at(w.fromCompId), w.fromPinIdx,
+                                        idMap.at(w.toCompId),   w.toPinIdx, w.waypoints);
+                    }
+                    if (!newIds.empty()) {
+                        multiSelectedIds_ = (newIds.size() > 1) ? newIds : std::vector<int>{};
+                        selectedCompId_   = newIds[0];
+                        propEditCompId_   = -1;
+                        // Arm the standard move machinery on the copies
+                        int moveId = idMap.count(ctrlDragCompId_) ? idMap.at(ctrlDragCompId_)
+                                                                  : newIds[0];
+                        movingCompId_    = moveId;
+                        moveStartCanvas_ = ctrlDragStart_;
+                        if (SchematicComp* mc = sch.findComp(moveId))
+                            moveCompOrigPos_ = mc->pos;
+                        multiMoveOrigPos_.clear();
+                        for (int nid : newIds)
+                            if (SchematicComp* mc = sch.findComp(nid))
+                                multiMoveOrigPos_.push_back({nid, mc->pos});
+                        moveWaypointOrig_.clear();
+                        std::unordered_set<int> movedSet(newIds.begin(), newIds.end());
+                        for (auto& w : sch.wires())
+                            if (!w.waypoints.empty() && movedSet.count(w.fromCompId) &&
+                                movedSet.count(w.toCompId))
+                                moveWaypointOrig_.push_back({w.id, w.waypoints});
+                    }
+                }
+                ctrlDragPending_ = false;
+            }
+        }
     }
 
     // ── Drag to move (single or multi) ────────────────────────────────────
@@ -2170,6 +2406,16 @@ void SchematicView::renderProperties(MainViewModel& vm) {
     const CompTypeDef* td = SchematicModel::findCompType(c->typeId);
     if (!td || c->typeId == "GND") return;
 
+    // Multi-edit: every selected component sharing the reference type receives
+    // the same param edits. Mixed-type selections edit only the matching ones.
+    std::vector<SchematicComp*> targets{c};
+    for (int cid : multiSelectedIds_) {
+        if (cid == selectedCompId_) continue;
+        SchematicComp* mc = sch.findComp(cid);
+        if (mc && mc->typeId == c->typeId) targets.push_back(mc);
+    }
+    const bool multiEdit = targets.size() > 1;
+
     // Refresh buffers when selection changes
     if (propEditCompId_ != selectedCompId_) {
         propEditCompId_ = selectedCompId_;
@@ -2183,16 +2429,29 @@ void SchematicView::renderProperties(MainViewModel& vm) {
     }
 
     ImGui::Separator();
-    ImGui::TextDisabled("Properties: %s (%s)  |  Rotation: %d°  [R to rotate]",
-                        c->instanceName.c_str(), td->displayName.c_str(),
-                        c->rotation * 90);
+    if (multiEdit)
+        ImGui::TextDisabled("Properties: %d x %s (editing all)  |  [R to rotate]",
+                            (int)targets.size(), td->displayName.c_str());
+    else
+        ImGui::TextDisabled("Properties: %s (%s)  |  Rotation: %d°  [R to rotate]",
+                            c->instanceName.c_str(), td->displayName.c_str(),
+                            c->rotation * 90);
 
-    ImGui::SetNextItemWidth(100.0f);
-    ImGui::InputText("Name##prop", propNameBuf_, sizeof(propNameBuf_));
-    if (ImGui::IsItemDeactivatedAfterEdit()) {
-        pushUndo(undoStack_, redoStack_, sch, kMaxUndo);
-        c->instanceName = propNameBuf_;
+    if (!multiEdit) {
+        // Instance names are unique — no renaming in multi-edit.
+        ImGui::SetNextItemWidth(100.0f);
+        ImGui::InputText("Name##prop", propNameBuf_, sizeof(propNameBuf_));
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            pushUndo(undoStack_, redoStack_, sch, kMaxUndo);
+            c->instanceName = propNameBuf_;
+        }
     }
+
+    // Expression-aware numeric parse: variables + arithmetic + SPICE suffixes.
+    const auto varMap = sch.variableMap();
+    auto parseNum = [&varMap](const std::string& s) -> double {
+        return exprv::evalOr(s, &varMap, 0.0);
+    };
 
     // Indices of the freq / tdelay / phase / _linkBy params for V_SQUARE so the
     // bidirectional linkage can update the right cells after each edit.
@@ -2207,87 +2466,66 @@ void SchematicView::renderProperties(MainViewModel& vm) {
         }
     }
 
+    // V_SQUARE phase ↔ tdelay linkage: updating one recomputes the other, and
+    // "_linkBy" remembers which the user touched so a later freq change knows
+    // which to preserve. Applied per component so multi-edit stays consistent.
+    auto applyLinkage = [&](SchematicComp& comp, int editedIdx) {
+        if (idxFreq < 0 || idxTDelay < 0 || idxPhase < 0 || idxLinkBy < 0) return;
+        if (editedIdx != idxFreq && editedIdx != idxTDelay && editedIdx != idxPhase) return;
+        if ((int)comp.paramValues.size() <= idxLinkBy) return;
+
+        double freq   = parseNum(comp.paramValues[idxFreq]);
+        double tdelay = parseNum(comp.paramValues[idxTDelay]);
+        double phase  = parseNum(comp.paramValues[idxPhase]);
+        if (freq <= 0.0) return;
+        auto fmt = [](double v) {
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "%.6g", v);
+            return std::string(buf);
+        };
+        bool byPhase;
+        if (editedIdx == idxPhase)       { byPhase = true;  comp.paramValues[idxLinkBy] = "phase"; }
+        else if (editedIdx == idxTDelay) { byPhase = false; comp.paramValues[idxLinkBy] = "tdelay"; }
+        else /* freq */                  { byPhase = (comp.paramValues[idxLinkBy] == "phase"); }
+
+        if (byPhase) {
+            tdelay = phase / 360.0 / freq;
+            comp.paramValues[idxTDelay] = fmt(tdelay);
+        } else {
+            phase = std::fmod(tdelay * freq * 360.0, 360.0);
+            if (phase >  180.0) phase -= 360.0;
+            if (phase < -180.0) phase += 360.0;
+            comp.paramValues[idxPhase] = fmt(phase);
+        }
+    };
+
     for (int i = 0; i < (int)td->params.size() && i < 8; ++i) {
         if (td->params[i].hidden) continue;     // skip internal book-keeping params
         ImGui::SameLine();
         ImGui::SetNextItemWidth(120.0f);
         ImGui::InputText(td->params[i].name.c_str(), propBufs_[i], sizeof(propBufs_[i]));
+        // Live evaluation feedback: show the resolved value (or an error) for
+        // expressions / variables while the field is being edited.
+        if (ImGui::IsItemActive() || ImGui::IsItemHovered()) {
+            double v;
+            if (exprv::tryEval(propBufs_[i], &varMap, v))
+                ImGui::SetTooltip("= %g", v);
+            else if (propBufs_[i][0] != '\0')
+                ImGui::SetTooltip("(not a numeric expression)");
+        }
         if (ImGui::IsItemDeactivatedAfterEdit() && i < (int)c->paramValues.size()) {
             pushUndo(undoStack_, redoStack_, sch, kMaxUndo);
-            c->paramValues[i] = propBufs_[i];
-
-            // V_SQUARE phase ↔ tdelay linkage: updating one recomputes the other,
-            // and "_linkBy" remembers which the user touched so a later freq
-            // change knows which to preserve. parseValue parses "1k" / "1m"
-            // suffixes the same way the netlist does.
-            if (idxFreq >= 0 && idxTDelay >= 0 && idxPhase >= 0 && idxLinkBy >= 0
-                && (i == idxFreq || i == idxTDelay || i == idxPhase))
-            {
-                auto parseNum = [](const std::string& s) -> double {
-                    if (s.empty()) return 0.0;
-                    char* end = nullptr;
-                    double v = std::strtod(s.c_str(), &end);
-                    if (end && *end) {
-                        switch (*end) {
-                            case 'p': v *= 1e-12; break;
-                            case 'n': v *= 1e-9;  break;
-                            case 'u': v *= 1e-6;  break;
-                            case 'm': v *= 1e-3;  break;
-                            case 'k': case 'K': v *= 1e3;  break;
-                            case 'M': v *= 1e6;  break;
-                            case 'G': v *= 1e9;  break;
-                            default: break;
-                        }
-                    }
-                    return v;
-                };
-                double freq   = parseNum(c->paramValues[idxFreq]);
-                double tdelay = parseNum(c->paramValues[idxTDelay]);
-                double phase  = parseNum(c->paramValues[idxPhase]);
-                if (freq > 0.0) {
-                    auto fmt = [](double v) {
-                        char buf[32];
-                        std::snprintf(buf, sizeof(buf), "%.6g", v);
-                        return std::string(buf);
-                    };
-                    if (i == idxPhase) {
-                        // User typed phase → recompute tdelay from it.
-                        tdelay = phase / 360.0 / freq;
-                        c->paramValues[idxTDelay] = fmt(tdelay);
-                        strncpy(propBufs_[idxTDelay], c->paramValues[idxTDelay].c_str(),
-                                sizeof(propBufs_[idxTDelay]) - 1);
-                        propBufs_[idxTDelay][sizeof(propBufs_[idxTDelay]) - 1] = '\0';
-                        c->paramValues[idxLinkBy] = "phase";
-                    } else if (i == idxTDelay) {
-                        // User typed tdelay → recompute phase. Wrap into ±360°.
-                        phase = std::fmod(tdelay * freq * 360.0, 360.0);
-                        if (phase >  180.0) phase -= 360.0;
-                        if (phase < -180.0) phase += 360.0;
-                        c->paramValues[idxPhase] = fmt(phase);
-                        strncpy(propBufs_[idxPhase], c->paramValues[idxPhase].c_str(),
-                                sizeof(propBufs_[idxPhase]) - 1);
-                        propBufs_[idxPhase][sizeof(propBufs_[idxPhase]) - 1] = '\0';
-                        c->paramValues[idxLinkBy] = "tdelay";
-                    } else if (i == idxFreq) {
-                        // Frequency changed → preserve whichever the user last set.
-                        const std::string& linkBy = c->paramValues[idxLinkBy];
-                        if (linkBy == "phase") {
-                            tdelay = phase / 360.0 / freq;
-                            c->paramValues[idxTDelay] = fmt(tdelay);
-                            strncpy(propBufs_[idxTDelay], c->paramValues[idxTDelay].c_str(),
-                                    sizeof(propBufs_[idxTDelay]) - 1);
-                            propBufs_[idxTDelay][sizeof(propBufs_[idxTDelay]) - 1] = '\0';
-                        } else {
-                            phase = std::fmod(tdelay * freq * 360.0, 360.0);
-                            if (phase >  180.0) phase -= 360.0;
-                            if (phase < -180.0) phase += 360.0;
-                            c->paramValues[idxPhase] = fmt(phase);
-                            strncpy(propBufs_[idxPhase], c->paramValues[idxPhase].c_str(),
-                                    sizeof(propBufs_[idxPhase]) - 1);
-                            propBufs_[idxPhase][sizeof(propBufs_[idxPhase]) - 1] = '\0';
-                        }
-                    }
-                }
+            for (SchematicComp* tc : targets) {
+                if (i >= (int)tc->paramValues.size()) continue;
+                tc->paramValues[i] = propBufs_[i];
+                applyLinkage(*tc, i);
+            }
+            // Sync linked cells (tdelay/phase) of the reference comp back into
+            // the visible buffers.
+            for (int k = 0; k < (int)c->paramValues.size() && k < 8; ++k) {
+                if (k == i) continue;
+                strncpy(propBufs_[k], c->paramValues[k].c_str(), sizeof(propBufs_[k])-1);
+                propBufs_[k][sizeof(propBufs_[k])-1] = '\0';
             }
         }
     }
@@ -2296,9 +2534,104 @@ void SchematicView::renderProperties(MainViewModel& vm) {
     ImGui::SameLine();
     if (ImGui::Button("Rotate 90°")) {
         pushUndo(undoStack_, redoStack_, sch, kMaxUndo);
-        c->rotation = (c->rotation + 1) % 4;
+        for (SchematicComp* tc : targets)
+            tc->rotation = (tc->rotation + 1) % 4;
         propEditCompId_ = -1;  // force buffer refresh next frame
     }
+}
+
+// ── Variables editor window ─────────────────────────────────────────────────
+
+void SchematicView::renderVariablesWindow(MainViewModel& vm) {
+    if (!varsWindowOpen_) return;
+    SchematicModel& sch = vm.schematic();
+
+    ImGui::SetNextWindowSize({460, 280}, ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Schematic Variables", &varsWindowOpen_)) { ImGui::End(); return; }
+
+    ImGui::TextDisabled("Usable in any numeric field: expressions (+ - * / parentheses),");
+    ImGui::TextDisabled("suffixes f p n u m k Meg g. Later rows may reference earlier ones.");
+    ImGui::Separator();
+
+    auto isValidName = [](const std::string& s) {
+        if (s.empty()) return false;
+        if (!std::isalpha((unsigned char)s[0]) && s[0] != '_') return false;
+        for (char ch : s)
+            if (!std::isalnum((unsigned char)ch) && ch != '_') return false;
+        return true;
+    };
+
+    auto& vars = sch.variables();
+    exprv::VarMap partial;   // grows row by row so each row sees the ones above
+    int removeIdx = -1;
+
+    if (ImGui::BeginTable("##varsTable", 4,
+                          ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg)) {
+        ImGui::TableSetupColumn("Name",       ImGuiTableColumnFlags_WidthFixed, 110.f);
+        ImGui::TableSetupColumn("Expression", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Value",      ImGuiTableColumnFlags_WidthFixed, 100.f);
+        ImGui::TableSetupColumn("##del",      ImGuiTableColumnFlags_WidthFixed, 24.f);
+        ImGui::TableHeadersRow();
+
+        for (int i = 0; i < (int)vars.size(); ++i) {
+            ImGui::PushID(i);
+            ImGui::TableNextRow();
+
+            char nameBuf[48], exprBuf[128];
+            strncpy(nameBuf, vars[i].name.c_str(), sizeof(nameBuf)-1);
+            nameBuf[sizeof(nameBuf)-1] = '\0';
+            strncpy(exprBuf, vars[i].expr.c_str(), sizeof(exprBuf)-1);
+            exprBuf[sizeof(exprBuf)-1] = '\0';
+
+            ImGui::TableNextColumn();
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            bool nameOk = isValidName(vars[i].name);
+            if (!nameOk) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.f,0.4f,0.4f,1.f));
+            if (ImGui::InputText("##name", nameBuf, sizeof(nameBuf)))
+                vars[i].name = nameBuf;
+            if (!nameOk) ImGui::PopStyleColor();
+            if (ImGui::IsItemDeactivatedAfterEdit())
+                pushUndo(undoStack_, redoStack_, sch, kMaxUndo);
+
+            ImGui::TableNextColumn();
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::InputText("##expr", exprBuf, sizeof(exprBuf)))
+                vars[i].expr = exprBuf;
+            if (ImGui::IsItemDeactivatedAfterEdit())
+                pushUndo(undoStack_, redoStack_, sch, kMaxUndo);
+
+            ImGui::TableNextColumn();
+            {
+                double v;
+                if (isValidName(vars[i].name) && exprv::tryEval(vars[i].expr, &partial, v)) {
+                    ImGui::Text("%g", v);
+                    std::string key = vars[i].name;
+                    std::transform(key.begin(), key.end(), key.begin(), ::toupper);
+                    partial[key] = v;
+                } else {
+                    ImGui::TextColored(ImVec4(1.f,0.4f,0.4f,1.f), "error");
+                }
+            }
+
+            ImGui::TableNextColumn();
+            if (ImGui::SmallButton("X")) removeIdx = i;
+
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+
+    if (removeIdx >= 0) {
+        pushUndo(undoStack_, redoStack_, sch, kMaxUndo);
+        vars.erase(vars.begin() + removeIdx);
+    }
+
+    if (ImGui::Button("+ Add variable")) {
+        pushUndo(undoStack_, redoStack_, sch, kMaxUndo);
+        vars.push_back({"var" + std::to_string(vars.size() + 1), "1"});
+    }
+
+    ImGui::End();
 }
 
 // ── Public File-action API ─────────────────────────────────────────────────

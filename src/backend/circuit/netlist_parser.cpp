@@ -10,6 +10,7 @@
 #include "components/sources/sin_source.h"
 #include "components/semiconductors/ideal_diode.h"
 #include "components/semiconductors/ideal_switch.h"
+#include "common/expr_eval.h"
 
 #include <fstream>
 #include <sstream>
@@ -31,6 +32,7 @@ ParseResult NetlistParser::parse(const std::string& filepath) {
 
 ParseResult NetlistParser::parseString(const std::string& content) {
     ParseResult result;
+    params_.clear();
     std::istringstream stream(content);
     std::string line;
     int lineNum = 0;
@@ -66,9 +68,14 @@ std::string NetlistParser::toUpper(std::string s) {
 }
 
 double NetlistParser::parseValue(const std::string& s) {
+    // Preferred path: full expression evaluation ("0.5/1e6", "2*Vin", ".PARAM" vars)
+    double v;
+    if (exprv::tryEval(s, &params_, v)) return v;
+
+    // Legacy lenient fallback: leading number + suffix, unknown trailing text ignored.
     double val = 0.0;
     char suffix[16] = {};
-    if (sscanf(s.c_str(), "%lf%s", &val, suffix) < 1) return 0.0;
+    if (sscanf(s.c_str(), "%lf%15s", &val, suffix) < 1) return 0.0;
     std::string suf = toUpper(suffix);
     if (suf == "F")      return val * 1e-15;
     if (suf == "P")      return val * 1e-12;
@@ -153,6 +160,26 @@ bool NetlistParser::processLine(const std::string& line, ParseResult& result) {
             }
             return true;
         }
+        if (first == ".PARAM") {
+            // .PARAM name=expr [name2=expr2 ...] — expr must not contain spaces.
+            // Later definitions may reference earlier ones.
+            for (size_t i = 1; i < tokens.size(); i++) {
+                size_t eq = tokens[i].find('=');
+                if (eq == std::string::npos || eq == 0) {
+                    result.error = ".PARAM: expected name=expr, got " + tokens[i];
+                    return false;
+                }
+                std::string name = toUpper(tokens[i].substr(0, eq));
+                std::string expr = tokens[i].substr(eq + 1);
+                double v;
+                if (!exprv::tryEval(expr, &params_, v)) {
+                    result.error = ".PARAM " + name + ": cannot evaluate '" + expr + "'";
+                    return false;
+                }
+                params_[name] = v;
+            }
+            return true;
+        }
         if (first == ".END") return true;
         return true; // ignore unknown dot commands
     }
@@ -197,7 +224,7 @@ bool NetlistParser::processLine(const std::string& line, ParseResult& result) {
                 for (size_t i = 4; i < tokens.size(); i++) {
                     std::string p = toUpper(tokens[i]);
                     if (p.find("FREQ=") == 0) freq = parseValue(p.substr(5));
-                    else if (p.find("DUTY=") == 0) duty = std::stod(p.substr(5));
+                    else if (p.find("DUTY=") == 0) duty = parseValue(p.substr(5));
                     else if (p.find("VHIGH=") == 0) vhigh = parseValue(p.substr(6));
                     else if (p.find("VLOW=") == 0) vlow = parseValue(p.substr(5));
                     else if (p.find("TDELAY=") == 0) tdelay = parseValue(p.substr(7));
@@ -219,7 +246,7 @@ bool NetlistParser::processLine(const std::string& line, ParseResult& result) {
                     if (p.find("VOFF=") == 0) voff = parseValue(p.substr(5));
                     else if (p.find("VAMPL=") == 0) vampl = parseValue(p.substr(6));
                     else if (p.find("FREQ=") == 0) freq = parseValue(p.substr(5));
-                    else if (p.find("PHASE=") == 0) phase = std::stod(p.substr(6));
+                    else if (p.find("PHASE=") == 0) phase = parseValue(p.substr(6));
                 }
                 result.circuit.addComponent(std::make_unique<SinSource>(name, np, nn, voff, vampl, freq, phase));
             } else {
@@ -299,14 +326,14 @@ bool NetlistParser::processLine(const std::string& line, ParseResult& result) {
                 for (size_t i = paramStart; i < tokens.size(); i++) {
                     std::string p = toUpper(tokens[i]);
                     if (p.find("RATIO=") == 0) {
-                        ratio = std::stod(p.substr(6));
+                        ratio = parseValue(p.substr(6));
                     } else if (p.find("TURNS") == 0) {
                         // turnsN= where N is 1-based winding index
                         size_t eqPos = p.find('=');
                         if (eqPos != std::string::npos) {
                             int idx = std::stoi(p.substr(5, eqPos - 5)); // 1-based
                             if (idx >= 1 && static_cast<size_t>(idx) <= numWindings)
-                                turns[idx - 1] = std::stod(p.substr(eqPos + 1));
+                                turns[idx - 1] = parseValue(p.substr(eqPos + 1));
                         }
                     }
                 }
