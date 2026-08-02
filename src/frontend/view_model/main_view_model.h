@@ -75,6 +75,21 @@ public:
     double currentTime() const;
     const std::string& statusMessage() const { return statusMsg_; }
 
+    // Auto-detected fundamental frequency (Hz) from the current build's switching
+    // devices; 0 when none is detectable. Used to seed the FFT window's f0 and to
+    // size the POP retention window.
+    double detectedFundamental() const;
+
+    // Start of the POP retention window set by the last applied trim (t_end -
+    // N/f0). Zoom delivery to views goes through ScopeModel::requestXZoom.
+    double popRetainStart() const { return popRetainStart_; }
+    // True once the current run's data has been POP-trimmed. Scopes created
+    // AFTER the trim (probe-created, New Scope, or recreated after the
+    // invisible-scope cull in MainView) have no pending zoom request, so their
+    // first-render X default must use [popRetainStart, t_end] instead of
+    // [0, t_end]. Cleared when a new run starts.
+    bool popTrimApplied() const { return popTrimApplied_; }
+
     // Diagnostics log
     const std::vector<DiagEvent>& diagLog() const { return diagLog_; }
     void clearDiagLog() { diagLog_.clear(); }
@@ -168,6 +183,18 @@ public:
 private:
     void dispatchSample(const SimSample& sample);
     void autoPopulateScope();
+
+    // POP retention: once the run completes, trim all buffers owned by the run
+    // doc (and its rawCache) to the last pop_periods fundamental periods.
+    void applyPopTrim();
+
+    // POP run state. popRunActive_ is armed by play() when config_.pop_enabled.
+    // popCompletePending_ counts render frames after completion is first observed
+    // so the final samples are fully drained before trimming.
+    bool popRunActive_       = false;
+    int  popCompletePending_ = 0;
+    double popRetainStart_   = 0.0;   // set by applyPopTrim on success
+    bool   popTrimApplied_   = false; // data is currently trimmed (see popTrimApplied())
 
     std::unique_ptr<Simulator> simulator_;
     std::vector<std::unique_ptr<ScopeModel>> scopes_;

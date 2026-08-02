@@ -2,13 +2,25 @@
 #include <algorithm>
 #include <cstdio>
 
-// Calculate the ScrollingBuffer capacity needed to store all simulation samples
-// at sample_ratio=1.  Capped at maxSamples to bound memory usage.
-// (5M doubles × 8 bytes × 2 arrays ≈ 80 MB per signal at the default cap)
-static size_t calcBufferCapacity(double tEnd, double dt, size_t maxSamples) {
-    if (tEnd <= 0.0 || dt <= 0.0) return std::min<size_t>(10000, maxSamples);
+// Choose an output-decimation ratio and the resulting per-signal buffer capacity
+// so at most `cap` points are STORED per signal while still spanning the whole
+// [0, tEnd] range. When the full-resolution point count exceeds `cap`, the
+// simulator subsamples its output (sample_ratio > 1) rather than letting the ring
+// buffer wrap and silently drop the oldest data. This bounds both memory AND the
+// scope's per-frame decimation cost; lowering `cap` trades plot detail at extreme
+// zoom for smoother pan/zoom and lower CPU on very long (tiny-dt) runs.
+static void calcSampleRatioAndCap(double tEnd, double dt, size_t cap,
+                                  int& outRatio, size_t& outCapacity) {
+    outRatio = 1;
+    if (tEnd <= 0.0 || dt <= 0.0) {
+        outCapacity = (cap == 0) ? 10000 : std::min<size_t>(10000, cap);
+        return;
+    }
+    if (cap < 2) cap = 2;
     size_t needed = static_cast<size_t>(tEnd / dt) + 1;
-    return std::min(needed, maxSamples);
+    if (needed > cap)
+        outRatio = static_cast<int>((needed + cap - 1) / cap);   // ceil division
+    outCapacity = needed / static_cast<size_t>(outRatio) + 2;    // +2 slack
 }
 
 MainViewModel::MainViewModel()
@@ -113,7 +125,9 @@ const ScopeModel& MainViewModel::scope(int idx) const {
 
 int MainViewModel::addScope() {
     auto sc = std::make_unique<ScopeModel>();
-    size_t cap = calcBufferCapacity(config_.t_end, config_.dt, maxStoredSamples_);
+    int ratio; size_t cap;
+    calcSampleRatioAndCap(config_.t_end, config_.dt, maxStoredSamples_, ratio, cap);
+    (void)ratio;  // sample_ratio is owned by the active config; only size matters here
     sc->setBufferCapacity(cap > 0 ? cap : 10000);
     // Pre-populate signalCache_ from the active doc's raw cache so that probe-added
     // signals immediately show historical waveform data even if this scope was
@@ -225,7 +239,15 @@ void MainViewModel::play() {
     if (!simulator_->isRunning()) {
         simulator_->start();
     }
+    // Arm POP retention for this run; the trim fires once the run completes.
+    popRunActive_       = config_.pop_enabled;
+    popCompletePending_ = 0;
+    popTrimApplied_     = false;   // new run: data is full-range again
     statusMsg_ = "Simulation running";
+}
+
+double MainViewModel::detectedFundamental() const {
+    return simulator_ ? simulator_->detectedFundamental() : 0.0;
 }
 
 void MainViewModel::pause() {
@@ -235,11 +257,17 @@ void MainViewModel::pause() {
 
 void MainViewModel::stop() {
     simulator_->stop();
+    popRunActive_       = false;   // stopped early: leave data untrimmed
+    popCompletePending_ = 0;
     statusMsg_ = "Simulation stopped";
 }
 
 void MainViewModel::reset() {
     diagLog_.clear();
+    // reset() reruns the full transient from t=0, so re-arm POP retention.
+    popRunActive_       = config_.pop_enabled;
+    popCompletePending_ = 0;
+    popTrimApplied_     = false;
     simulator_->reset();
     // Only clear the active doc's rawCache + its owned scope buffers; other docs'
     // data is preserved.
@@ -273,6 +301,68 @@ void MainViewModel::update() {
             diagLog_.erase(diagLog_.begin());  // drop oldest to stay within cap
         diagLog_.push_back(std::move(dev));
     }
+
+    // POP retention: when the run has reached t_end, wait one extra frame so any
+    // in-flight final samples are drained, then trim to the last N periods.
+    if (popRunActive_ && simulator_->currentTime() >= config_.t_end) {
+        if (popCompletePending_ >= 1) {
+            applyPopTrim();
+            popRunActive_       = false;
+            popCompletePending_ = 0;
+        } else {
+            ++popCompletePending_;
+        }
+    }
+}
+
+void MainViewModel::applyPopTrim() {
+    double f0 = simulator_->detectedFundamental();
+    if (f0 <= 0.0) {
+        statusMsg_ = "POP: no switching fundamental detected — data kept in full";
+        diagLog_.push_back({DiagEvent::Warning, config_.t_end,
+                            "POP: no switching fundamental detected - data kept in full"});
+        return;
+    }
+    int periods = config_.pop_periods > 0 ? config_.pop_periods : 1;
+    double window = periods / f0;                 // seconds to retain
+    double xMin   = config_.t_end - window;
+    if (xMin <= 0.0) return;                       // whole run already within window
+
+    // Trim every scope buffer owned by the run doc (or untagged), plus the run
+    // doc's rawCache so later-added probes also see only the retained window.
+    // Scopes with trimmed entries get a pending X-zoom request, which the owning
+    // ScopeView consumes on its next actual render (survives hidden windows and
+    // background dock tabs — a same-frame notification would be missed there).
+    for (auto& sc : scopes_) {
+        bool trimmedAny = false;
+        for (int pi = 0; pi < sc->plotCount(); ++pi) {
+            PlotArea* p = sc->getPlot(pi);
+            if (!p) continue;
+            for (auto& e : p->entries) {
+                if (e->sourceSchId == -1 || e->sourceSchId == lastBuiltDocId_) {
+                    e->buffer.trimBefore(xMin);
+                    trimmedAny = true;
+                }
+            }
+        }
+        if (trimmedAny)
+            sc->requestXZoom(xMin, config_.t_end);
+    }
+    if (lastBuiltDocId_ >= 0) {
+        int idx = findSchDocById(lastBuiltDocId_);
+        if (idx >= 0)
+            for (auto& [name, buf] : schDocs_[idx]->rawCache)
+                buf.trimBefore(xMin);
+    }
+
+    popRetainStart_ = xMin;
+    popTrimApplied_ = true;   // scopes created after this get the POP-window default
+
+    char buf[128];
+    snprintf(buf, sizeof(buf),
+             "POP: kept %d period(s) @ %.6g Hz (t >= %.6g s)", periods, f0, xMin);
+    statusMsg_ = buf;
+    diagLog_.push_back({DiagEvent::Info, config_.t_end, buf});
 }
 
 void MainViewModel::dispatchSample(const SimSample& sample) {
@@ -407,9 +497,11 @@ void MainViewModel::applySimConfig(double dt, double tEnd) {
     config_.dt    = dt;
     config_.t_end = tEnd;
 
-    // Storage side: always ratio=1; rebuild buffers with new capacity
-    config_.sample_ratio = 1;
-    size_t cap = calcBufferCapacity(tEnd, dt, maxStoredSamples_);
+    // Storage side: decimate the simulator's output so at most maxStoredSamples_
+    // points are kept per signal over the whole range; rebuild buffers to match.
+    int ratio; size_t cap;
+    calcSampleRatioAndCap(tEnd, dt, maxStoredSamples_, ratio, cap);
+    config_.sample_ratio = ratio;
     for (auto& sc : scopes_) sc->resizeAllBuffers(cap);
 
     // Re-initialise simulator with updated config (resets to t=0)
@@ -523,6 +615,16 @@ void MainViewModel::buildFromSchematic() {
     config_  = result.config;
     probes_  = result.probes;
 
+    // Derive the output-decimation ratio + buffer capacity BEFORE setup, so the
+    // simulator subsamples at the source for long (tiny-dt) runs instead of the
+    // ring buffer wrapping and dropping old data. storedCap is reused below.
+    size_t storedCap;
+    {
+        int ratio;
+        calcSampleRatioAndCap(config_.t_end, config_.dt, maxStoredSamples_, ratio, storedCap);
+        config_.sample_ratio = ratio;
+    }
+
     if (!simulator_->setup(*circuit_, config_, probes_)) {
         statusMsg_ = "Failed to setup simulator from schematic";
         return;
@@ -573,8 +675,8 @@ void MainViewModel::buildFromSchematic() {
 
     if (cancelBuild_.load()) return;
 
-    config_.sample_ratio = 1;
-    size_t newCap = calcBufferCapacity(config_.t_end, config_.dt, maxStoredSamples_);
+    // sample_ratio + capacity were already derived above (before setup).
+    size_t newCap = storedCap;
 
     // Reset only the building doc's per-sch rawCache; other docs keep their
     // last-run data so their owning scopes can keep displaying historical waves.

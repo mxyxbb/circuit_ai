@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+#include <initializer_list>
 #include <unordered_map>
 #include <unordered_set>
 #include <fstream>
@@ -95,6 +96,108 @@ float SchematicView::distPointToSegment(ImVec2 pt, ImVec2 a, ImVec2 b) {
     ImVec2 closest = {a.x + t*ab.x, a.y + t*ab.y};
     ImVec2 diff = {pt.x - closest.x, pt.y - closest.y};
     return sqrtf(diff.x*diff.x + diff.y*diff.y);
+}
+
+// Point-in-convex-polygon OR within m of its boundary. Winding-agnostic; used by
+// the outline-following component hit test. Distance-to-edge is inlined so this
+// stays a free function (no access to private static helpers needed).
+static bool pointInConvexOrNear(ImVec2 p, const ImVec2* v, int n, float m) {
+    for (int i = 0; i < n; ++i) {
+        ImVec2 a = v[i], b = v[(i + 1) % n];
+        ImVec2 ab = {b.x - a.x, b.y - a.y}, ap = {p.x - a.x, p.y - a.y};
+        float ab2 = ab.x*ab.x + ab.y*ab.y;
+        float t = ab2 < 1e-8f ? 0.f : (ap.x*ab.x + ap.y*ab.y) / ab2;
+        t = t < 0.f ? 0.f : (t > 1.f ? 1.f : t);
+        float dx = p.x - (a.x + t*ab.x), dy = p.y - (a.y + t*ab.y);
+        if (sqrtf(dx*dx + dy*dy) <= m) return true;   // within the margin band
+    }
+    bool pos = false, neg = false;                     // inside test (convex)
+    for (int i = 0; i < n; ++i) {
+        ImVec2 a = v[i], b = v[(i + 1) % n];
+        float cross = (b.x - a.x)*(p.y - a.y) - (b.y - a.y)*(p.x - a.x);
+        if (cross > 0.f) pos = true; else if (cross < 0.f) neg = true;
+    }
+    return !(pos && neg);
+}
+
+// Fine-grained component hit test — see header. Symbol geometry is expressed in
+// the component's LOCAL frame (the same ox,oy fed to sc() in drawCompSymbol), so
+// we first map pt back through the component's translate → rotation → mirror.
+bool SchematicView::hitTestCompBody(const SchematicComp& comp, ImVec2 pt, float m) {
+    const CompTypeDef* td = SchematicModel::findCompType(comp.typeId);
+    if (!td) return false;
+
+    ImVec2 d = { pt.x - comp.pos.x, pt.y - comp.pos.y };
+    ImVec2 r = rotateOff(d, (4 - (comp.rotation % 4)) % 4);   // inverse rotation
+    ImVec2 L = { comp.mirrorX ? -r.x : r.x, r.y };            // undo mirror
+
+    auto seg = [&](float ax, float ay, float bx, float by) {
+        return distPointToSegment(L, {ax, ay}, {bx, by}) <= m;
+    };
+    auto circ = [&](float cx, float cy, float rad) {
+        float dx = L.x - cx, dy = L.y - cy;
+        return sqrtf(dx*dx + dy*dy) <= rad + m;
+    };
+    auto poly = [&](std::initializer_list<ImVec2> pts) {
+        return pointInConvexOrNear(L, pts.begin(), (int)pts.size(), m);
+    };
+
+    const std::string& id = comp.typeId;
+    if (id == "R")
+        return poly({{-14.f,-7.f},{14.f,-7.f},{14.f,7.f},{-14.f,7.f}})
+            || seg(-40.f,0.f,-14.f,0.f) || seg(14.f,0.f,40.f,0.f);
+    if (id == "C")
+        return poly({{-5.f,-12.f},{5.f,-12.f},{5.f,12.f},{-5.f,12.f}})
+            || seg(-20.f,0.f,-5.f,0.f) || seg(5.f,0.f,20.f,0.f);
+    if (id == "L")
+        return poly({{-24.f,-7.f},{24.f,-7.f},{24.f,2.f},{-24.f,2.f}})
+            || seg(-40.f,0.f,-24.f,0.f) || seg(24.f,0.f,40.f,0.f);
+    if (id == "V_DC" || id == "V_SIN" || id == "V_SQUARE" || id == "V_STEP" || id == "I")
+        return circ(0.f,0.f,18.f) || seg(-40.f,0.f,-18.f,0.f) || seg(18.f,0.f,40.f,0.f);
+    if (id == "VCVS" || id == "VCCS")
+        return poly({{0.f,-16.f},{16.f,0.f},{0.f,16.f},{-16.f,0.f}})
+            || seg(0.f,-40.f,0.f,-16.f) || seg(0.f,16.f,0.f,40.f) || seg(-40.f,0.f,-26.f,0.f);
+    if (id == "OPAMP" || id == "CMP")
+        return poly({{-24.f,-24.f},{24.f,0.f},{-24.f,24.f}})
+            || seg(-40.f,-20.f,-24.f,-20.f) || seg(-40.f,20.f,-24.f,20.f) || seg(24.f,0.f,40.f,0.f);
+    if (id == "D")
+        return poly({{-12.f,-10.f},{12.f,0.f},{-12.f,10.f}})
+            || seg(-40.f,0.f,-12.f,0.f) || seg(12.f,0.f,40.f,0.f) || seg(12.f,-12.f,12.f,12.f);
+    if (id == "JUNC")
+        return circ(0.f,0.f,5.f);
+    if (id == "NETLABEL")
+        return poly({{-20.f,0.f},{-16.f,-7.f},{-4.f,-7.f},{-4.f,7.f},{-16.f,7.f}});
+    if (id == "GND")   // asymmetric: stem 0..18 along local +y, ±6 across
+        return L.y >= -2.f - m && L.y <= 18.f + m && std::fabs(L.x) <= 6.f + m;
+    if (id == "S")     // MOSFET: gate group, channel, D/S rails, leads, body arrow
+        return seg(-20.f,0.f,-5.f,0.f) || seg(-20.f,20.f,-5.f,20.f) || seg(-5.f,-15.f,-5.f,20.f)
+            || seg(0.f,-20.f,0.f,-10.f)|| seg(0.f,-5.f,0.f,5.f)     || seg(0.f,10.f,0.f,20.f)
+            || seg(0.f,-15.f,20.f,-15.f)|| seg(0.f,0.f,20.f,0.f)    || seg(0.f,15.f,20.f,15.f)
+            || seg(20.f,-15.f,20.f,-25.f)|| seg(20.f,0.f,20.f,25.f)
+            || seg(20.f,-20.f,33.f,-20.f)|| seg(20.f,20.f,33.f,20.f)
+            || seg(33.f,-20.f,33.f,-5.f)|| seg(33.f,5.f,33.f,20.f)
+            || seg(20.f,-40.f,20.f,-25.f)|| seg(20.f,25.f,20.f,40.f)
+            || poly({{0.f,0.f},{10.f,-5.f},{10.f,5.f}});
+    if (id == "TX")
+        return poly({{-28.f,-18.f},{-16.f,-18.f},{-16.f,18.f},{-28.f,18.f}})
+            || poly({{16.f,-18.f},{28.f,-18.f},{28.f,18.f},{16.f,18.f}})
+            || seg(-5.f,-18.f,-5.f,18.f) || seg(5.f,-18.f,5.f,18.f)
+            || seg(-40.f,-20.f,-22.f,-18.f) || seg(-40.f,20.f,-22.f,18.f)
+            || seg(40.f,-20.f,22.f,-18.f)   || seg(40.f,20.f,22.f,18.f);
+    if (id == "TX3")
+        return poly({{-28.f,-18.f},{-16.f,-18.f},{-16.f,18.f},{-28.f,18.f}})
+            || poly({{16.f,-30.f},{28.f,-30.f},{28.f,30.f},{16.f,30.f}})
+            || seg(-5.f,-30.f,-5.f,30.f) || seg(5.f,-30.f,5.f,30.f)
+            || seg(-40.f,-20.f,-22.f,-18.f) || seg(-40.f,20.f,-22.f,18.f)
+            || seg(40.f,-30.f,22.f,-30.f) || seg(40.f,-10.f,22.f,-10.f)
+            || seg(40.f,10.f,22.f,10.f)   || seg(40.f,30.f,22.f,30.f);
+    if (id == "TX_WIND")
+        return poly({{-6.f,-24.f},{6.f,-24.f},{6.f,24.f},{-6.f,24.f}})
+            || seg(0.f,-40.f,0.f,-24.f) || seg(0.f,24.f,0.f,40.f);
+
+    // Any unlisted type (TX_CORE, TXN_CUSTOM, …): tighter local-frame AABB.
+    return std::fabs(L.x) <= td->bodyHalfSize.x + m &&
+           std::fabs(L.y) <= td->bodyHalfSize.y + m;
 }
 
 // Auto corner: when a wire segment from → to is diagonal, insert the Manhattan
@@ -633,6 +736,26 @@ void SchematicView::render(MainViewModel& vm) {
     ImGui::SetNextItemWidth(80.0f);
     ImGui::InputText("##schtend", sch.simCfg.tEnd, sizeof(sch.simCfg.tEnd));
     ImGui::SameLine();
+    // ── POP (Periodic Operating Point) ──────────────────────────────────────
+    // Keep only the last N fundamental periods after the run completes. The
+    // fundamental is auto-detected from the largest-current switch's gate drive.
+    ImGui::Checkbox("POP", &sch.simCfg.popEnabled);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "Periodic Operating Point mode.\n"
+            "After the run completes, discards everything except the last N\n"
+            "fundamental-frequency periods before t_end. The fundamental is\n"
+            "auto-detected from the gate-drive frequency of the switch carrying\n"
+            "the largest current, and seeds the FFT window's f0.");
+    if (sch.simCfg.popEnabled) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("N:");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(50.0f);
+        ImGui::InputText("##schpopn", sch.simCfg.popPeriods, sizeof(sch.simCfg.popPeriods),
+                         ImGuiInputTextFlags_CharsDecimal);
+    }
+    ImGui::SameLine();
     {
         bool active = varsWindowOpen_;
         if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f,0.5f,0.7f,1.0f));
@@ -712,7 +835,18 @@ void SchematicView::render(MainViewModel& vm) {
                 for (int i = 0; i < 6; ++i) snprintf(txNTurns_[i], 16, "%d", i==0?10:1);
             } else {
                 pushUndo(undoStack_, redoStack_, sch, kMaxUndo);
-                sch.addComp(typeId, dropCanvas);
+                bool placed = false;
+                if (typeId == "JUNC") {
+                    // Dropping a junction onto an existing wire splits the wire
+                    // and ties the junction in (a real electrical T-point)
+                    // instead of leaving a free-floating dot that only looks
+                    // connected.
+                    ImVec2 snapPt;
+                    int wid = hitTestWire(sch, dropCanvas, 10.0f, &snapPt);
+                    if (wid >= 0 && insertJunctionOnWire(sch, wid, snapPt) >= 0)
+                        placed = true;
+                }
+                if (!placed) sch.addComp(typeId, dropCanvas);
             }
         }
         ImGui::EndDragDropTarget();
@@ -725,6 +859,19 @@ void SchematicView::render(MainViewModel& vm) {
     drawWires(dl, vm, origin);
     drawComponents(dl, vm, origin);
     drawRubberBand(dl, vm, origin);
+
+    // Alt+hover over a wire (not wiring): preview the junction tap point where
+    // Alt+click would insert a junction and start a new wire.
+    if (canvasHovered && !wiringActive_ && probeMode_ == PM_None
+        && ImGui::GetIO().KeyAlt) {
+        ImVec2 snapPt;
+        int wid = hitTestWire(sch, s2c(ImGui::GetMousePos(), origin),
+                              6.0f / zoom_, &snapPt);
+        if (wid >= 0) {
+            ImVec2 s = c2s(snapPt, origin);
+            dl->AddCircle(s, 5.0f * zoom_, IM_COL32(80, 220, 120, 230), 0, 2.0f);
+        }
+    }
 
     // ── V-probe drag highlights ────────────────────────────────────────────
     if (vProbeDragActive_) {
@@ -872,6 +1019,7 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
     // ── Escape: cancel wiring / probe drag ────────────────────────────────
     if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
         if (wiringActive_) { wiringActive_ = false; wireFromCompId_ = -1; wireWaypoints_.clear(); }
+        if (pinPendingActive_) pinPendingActive_ = false;
         if (vProbeDragActive_) { vProbeDragActive_ = false; vProbeNodeA_ = vProbeNodeB_ = -1; probeMode_ = PM_None; }
     }
 
@@ -913,8 +1061,13 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
         }
     }
 
+    // While a text field is focused (e.g. the property-value editor), the canvas
+    // keyboard shortcuts below must defer to it — otherwise typing/pasting into a
+    // value would rotate/mirror/copy/paste components instead.
+    const bool typingInField = ImGui::GetIO().WantTextInput;
+
     // ── R key: rotate selected component(s) ───────────────────────────────
-    if (ImGui::IsKeyPressed(ImGuiKey_R)) {
+    if (!typingInField && ImGui::IsKeyPressed(ImGuiKey_R)) {
         auto targets = multiSelectedIds_.empty()
             ? std::vector<int>{selectedCompId_} : multiSelectedIds_;
         bool hasTarget = false;
@@ -928,7 +1081,7 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
     }
 
     // ── X key: mirror selected component(s) ───────────────────────────────
-    if (ImGui::IsKeyPressed(ImGuiKey_X)) {
+    if (!typingInField && ImGui::IsKeyPressed(ImGuiKey_X)) {
         auto targets = multiSelectedIds_.empty()
             ? std::vector<int>{selectedCompId_} : multiSelectedIds_;
         bool hasTarget = false;
@@ -943,7 +1096,7 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
 
     // ── Ctrl+C: store selection in the schematic clipboard ─────────────────
     // (placement happens on Ctrl+V — nothing is added to the canvas here)
-    if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C)) {
+    if (!typingInField && ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C)) {
         std::vector<int> toCopy = multiSelectedIds_.empty()
             ? std::vector<int>{selectedCompId_} : multiSelectedIds_;
         toCopy.erase(std::remove(toCopy.begin(), toCopy.end(), -1), toCopy.end());
@@ -968,7 +1121,7 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
     // ── Ctrl+V: place the clipboard content ────────────────────────────────
     // Pastes at the mouse cursor when it hovers the canvas; otherwise offsets
     // the original location by one grid cell so the copy stays visible.
-    if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_V) && !clipComps_.empty()) {
+    if (!typingInField && ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_V) && !clipComps_.empty()) {
         ImVec2 target = hovered ? snapGrid(mousePt)
                                 : ImVec2{clipRefPos_.x + 40.f, clipRefPos_.y + 40.f};
         ImVec2 delta = { snapGrid({target.x - clipRefPos_.x, target.y - clipRefPos_.y}).x,
@@ -1270,9 +1423,12 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
         // so it doesn't shadow the body or adjacent pins. For pins at the
         // component center (e.g. JUNC, GND) the outward direction is degenerate;
         // fall back to a small symmetric circle.
-        const float pinOutward = 14.0f / zoom_;
-        const float pinInward  = 4.0f  / zoom_;
-        const float pinPerp    = 5.0f  / zoom_;
+        // Sizes tuned so wiring is easy to start (generous outward + perp)
+        // without stealing body clicks: a press on a pin no longer locks into
+        // wiring immediately — see the deferred pinPending_ resolution below.
+        const float pinOutward = 16.0f / zoom_;
+        const float pinInward  = 6.0f  / zoom_;
+        const float pinPerp    = 8.0f  / zoom_;
         for (auto& comp : sch.comps()) {
             const CompTypeDef* td = SchematicModel::findCompType(comp.typeId);
             if (!td) continue;
@@ -1307,10 +1463,15 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
                         }
                         wiringActive_ = false; wireFromCompId_ = -1; wireWaypoints_.clear();
                     } else {
-                        wiringActive_   = true;
-                        wireFromCompId_ = comp.id;
-                        wireFromPinIdx_ = pi;
-                        wireWaypoints_.clear();
+                        // Defer the decision to release: a stationary click
+                        // starts wiring, a drag past the threshold moves the
+                        // component instead (grabbing a comp by its lead, or
+                        // GND/JUNC whose pin covers the whole symbol, must not
+                        // lock into wiring mode).
+                        pinPendingActive_ = true;
+                        pinPendingCompId_ = comp.id;
+                        pinPendingPinIdx_ = pi;
+                        pinPendingStart_  = mousePt;
                     }
                     hitPin = true;
                     break;
@@ -1321,41 +1482,8 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
 
         // During wiring: check wire-to-wire hit, otherwise add waypoint
         if (!hitPin && wiringActive_) {
-            float wireHitR2 = (8.0f / zoom_) * (8.0f / zoom_);
-            int hitWireId = -1;
-            ImVec2 hitWireSnap = snapGrid(mousePt);
-            for (auto& w : sch.wires()) {
-                // Build full path including waypoints
-                SchematicComp* fc = sch.findComp(w.fromCompId);
-                SchematicComp* tc = sch.findComp(w.toCompId);
-                if (!fc || !tc) continue;
-                const CompTypeDef* ftd = SchematicModel::findCompType(fc->typeId);
-                const CompTypeDef* ttd = SchematicModel::findCompType(tc->typeId);
-                if (!ftd || !ttd) continue;
-                ImVec2 fPos = pinCanvasPos(*fc, w.fromPinIdx);
-                ImVec2 tPos = pinCanvasPos(*tc, w.toPinIdx);
-                std::vector<ImVec2> path;
-                path.push_back(fPos);
-                for (auto& wp : w.waypoints) path.push_back(wp);
-                path.push_back(tPos);
-                for (int si = 0; si + 1 < (int)path.size(); ++si) {
-                    float d = distPointToSegment(mousePt, path[si], path[si+1]);
-                    if (d*d <= wireHitR2) {
-                        hitWireId = w.id;
-                        // Snap junction to nearest point on segment
-                        ImVec2 a = path[si], b = path[si+1];
-                        ImVec2 ab = {b.x-a.x, b.y-a.y};
-                        float len2 = ab.x*ab.x + ab.y*ab.y;
-                        if (len2 > 0.f) {
-                            float t = ((mousePt.x-a.x)*ab.x + (mousePt.y-a.y)*ab.y) / len2;
-                            t = t < 0.f ? 0.f : (t > 1.f ? 1.f : t);
-                            hitWireSnap = snapGrid({a.x + t*ab.x, a.y + t*ab.y});
-                        }
-                        break;
-                    }
-                }
-                if (hitWireId >= 0) break;
-            }
+            ImVec2 hitWireSnap;
+            int hitWireId = hitTestWire(sch, mousePt, 8.0f / zoom_, &hitWireSnap);
             if (hitWireId >= 0) {
                 pushUndo(undoStack_, redoStack_, sch, kMaxUndo);
                 // Resolve start-pin position BEFORE insertJunctionOnWire — it
@@ -1383,32 +1511,13 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
 
         // Priority 2: component bodies (only when not wiring)
         if (!hitPin && !wiringActive_) {
+            // Hit region follows the symbol outline (strokes / filled bodies),
+            // expanded by a few screen px converted to canvas units — replacing
+            // the old coarse AABB so clicks in empty corners no longer select.
+            const float hitMargin = 5.0f / zoom_;
             for (auto& comp : sch.comps()) {
-                const CompTypeDef* td = SchematicModel::findCompType(comp.typeId);
-                if (!td) continue;
-                // Body half-size swaps on 90°/270°
-                float bx = td->bodyHalfSize.x, by = td->bodyHalfSize.y;
-                if (comp.rotation % 2 == 1) std::swap(bx, by);
-                // Generic AABB body hit unless overridden below.
-                bool bodyHit = (mousePt.x >= comp.pos.x - bx && mousePt.x <= comp.pos.x + bx &&
-                                mousePt.y >= comp.pos.y - by && mousePt.y <= comp.pos.y + by);
-                if (comp.typeId == "GND") {
-                    // The ground symbol is asymmetric: pin sits at comp.pos and
-                    // the bars extend ONE direction along the stem (rotation
-                    // dependent). A symmetric AABB hits empty space on the
-                    // opposite side. Use a directional rectangle that tracks
-                    // the actual visual: 0..18 along the stem direction, ±6
-                    // perpendicular.
-                    ImVec2 sv = rotateOff({0.0f, 1.0f}, comp.rotation);  // stem direction
-                    float dxp = mousePt.x - comp.pos.x;
-                    float dyp = mousePt.y - comp.pos.y;
-                    float along = dxp * sv.x + dyp * sv.y;
-                    float pxr   = dxp - along * sv.x;
-                    float pyr   = dyp - along * sv.y;
-                    float perp  = sqrtf(pxr*pxr + pyr*pyr);
-                    bodyHit = (along >= -2.0f && along <= 18.0f && perp <= 6.0f);
-                }
-                if (bodyHit) {
+                if (!hitTestCompBody(comp, mousePt, hitMargin)) continue;
+                {
                     wiringActive_ = false;
                     wireWaypoints_.clear();
 
@@ -1434,47 +1543,9 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
                             propEditCompId_ = -1;
                         }
                     } else {
-                        // Normal click: if already in multi-select, start multi-move
-                        bool inMulti = !multiSelectedIds_.empty() &&
-                            std::find(multiSelectedIds_.begin(), multiSelectedIds_.end(), comp.id)
-                                != multiSelectedIds_.end();
-                        if (!inMulti) {
-                            // Single-select this component
-                            multiSelectedIds_.clear();
-                            selectedCompId_ = comp.id;
-                        }
-                        movingCompId_    = comp.id;
-                        moveStartCanvas_ = mousePt;
-                        moveCompOrigPos_ = comp.pos;
-                        pushUndo(undoStack_, redoStack_, sch, kMaxUndo);
-                        // Store original positions of all selected for multi-move
-                        multiMoveOrigPos_.clear();
-                        auto& toMove = inMulti ? multiSelectedIds_ : std::vector<int>{comp.id};
-                        for (int cid : toMove) {
-                            SchematicComp* mc = sch.findComp(cid);
-                            if (mc) multiMoveOrigPos_.push_back({cid, mc->pos});
-                        }
-                        // Store original waypoints for wires fully inside the moved set
-                        moveWaypointOrig_.clear();
-                        std::unordered_set<int> movedSet;
-                        for (auto& [cid, origP] : multiMoveOrigPos_) movedSet.insert(cid);
-                        for (auto& w : sch.wires()) {
-                            if (!w.waypoints.empty()
-                                && movedSet.count(w.fromCompId)
-                                && movedSet.count(w.toCompId))
-                                moveWaypointOrig_.push_back({w.id, w.waypoints});
-                        }
-                        // Refresh property buffers
-                        if (propEditCompId_ != comp.id) {
-                            propEditCompId_ = comp.id;
-                            strncpy(propNameBuf_, comp.instanceName.c_str(), sizeof(propNameBuf_)-1);
-                            propNameBuf_[sizeof(propNameBuf_)-1] = '\0';
-                            for (int i = 0; i < 8; ++i) propBufs_[i][0] = '\0';
-                            for (int i = 0; i < (int)comp.paramValues.size() && i < 8; ++i) {
-                                strncpy(propBufs_[i], comp.paramValues[i].c_str(), sizeof(propBufs_[i])-1);
-                                propBufs_[i][sizeof(propBufs_[i])-1] = '\0';
-                            }
-                        }
+                        // Normal click: select + arm move (multi-move if the
+                        // comp is already part of the multi-selection)
+                        beginCompMove(sch, comp, mousePt);
                     }
                     hitBody = true;
                     break;
@@ -1503,7 +1574,27 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
                     if (d < bestDist) { bestDist = d; bestWireId = wire.id; bestSeg = (int)i - 1; }
                 }
             }
-            if (bestWireId != -1) {
+            if (bestWireId != -1 && ImGui::GetIO().KeyAlt) {
+                // Alt+click: tap the wire — insert a junction at the click
+                // point and start routing a new wire from it (mirror of the
+                // end-on-wire auto-junction that already exists).
+                ImVec2 snapPt;
+                int wid = hitTestWire(sch, mousePt, wireHitR, &snapPt);
+                if (wid >= 0) {
+                    pushUndo(undoStack_, redoStack_, sch, kMaxUndo);
+                    int juncId = insertJunctionOnWire(sch, wid, snapPt);
+                    if (juncId >= 0) {
+                        wiringActive_   = true;
+                        wireFromCompId_ = juncId;
+                        wireFromPinIdx_ = 0;
+                        wireWaypoints_.clear();
+                        selectedWireId_ = -1;
+                        selectedCompId_ = -1;
+                        multiSelectedIds_.clear();
+                        propEditCompId_ = -1;
+                    }
+                }
+            } else if (bestWireId != -1) {
                 selectedWireId_   = bestWireId;
                 selectedCompId_   = -1;
                 multiSelectedIds_.clear();
@@ -1756,6 +1847,28 @@ void SchematicView::handleInput(MainViewModel& vm, bool hovered, ImVec2 origin) 
         }
     }
 
+    // ── Deferred pin press resolution ──────────────────────────────────────
+    // Release without movement → start wiring from the pressed pin.
+    // Drag past the threshold   → move the component instead.
+    if (pinPendingActive_) {
+        float dx = mousePt.x - pinPendingStart_.x;
+        float dy = mousePt.y - pinPendingStart_.y;
+        float th = 5.0f / zoom_;   // ~5 px screen
+        if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            if (dx*dx + dy*dy > th*th) {
+                pinPendingActive_ = false;
+                if (SchematicComp* pc = sch.findComp(pinPendingCompId_))
+                    beginCompMove(sch, *pc, pinPendingStart_);
+            }
+        } else {
+            pinPendingActive_ = false;
+            wiringActive_   = true;
+            wireFromCompId_ = pinPendingCompId_;
+            wireFromPinIdx_ = pinPendingPinIdx_;
+            wireWaypoints_.clear();
+        }
+    }
+
     // ── Drag to move (single or multi) ────────────────────────────────────
     if (movingCompId_ != -1) {
         if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
@@ -1935,6 +2048,88 @@ int SchematicView::insertJunctionOnWire(SchematicModel& sch, int wireId, ImVec2 
     return juncId;
 }
 
+// ── Wire hit-test ──────────────────────────────────────────────────────────
+
+int SchematicView::hitTestWire(const SchematicModel& sch, ImVec2 pt, float maxDist,
+                               ImVec2* outSnap) const {
+    int bestId = -1;
+    float bestD = maxDist;
+    ImVec2 snap = snapGrid(pt);
+    for (const auto& w : sch.wires()) {
+        const SchematicComp* fc = sch.findComp(w.fromCompId);
+        const SchematicComp* tc = sch.findComp(w.toCompId);
+        if (!fc || !tc) continue;
+        std::vector<ImVec2> path;
+        path.push_back(pinCanvasPos(*fc, w.fromPinIdx));
+        for (const auto& wp : w.waypoints) path.push_back(wp);
+        path.push_back(pinCanvasPos(*tc, w.toPinIdx));
+        for (size_t i = 1; i < path.size(); ++i) {
+            float d = distPointToSegment(pt, path[i-1], path[i]);
+            if (d < bestD) {
+                bestD  = d;
+                bestId = w.id;
+                // Grid-snapped projection of pt onto the hit segment
+                ImVec2 a = path[i-1], b = path[i];
+                ImVec2 ab = {b.x - a.x, b.y - a.y};
+                float len2 = ab.x*ab.x + ab.y*ab.y;
+                float t = len2 > 0.f
+                    ? ((pt.x-a.x)*ab.x + (pt.y-a.y)*ab.y) / len2 : 0.f;
+                t = t < 0.f ? 0.f : (t > 1.f ? 1.f : t);
+                snap = snapGrid({a.x + t*ab.x, a.y + t*ab.y});
+            }
+        }
+    }
+    if (outSnap) *outSnap = snap;
+    return bestId;
+}
+
+// ── Component move arming (shared by body-click and pin-drag) ──────────────
+
+void SchematicView::beginCompMove(SchematicModel& sch, SchematicComp& comp, ImVec2 pressPt) {
+    bool inMulti = !multiSelectedIds_.empty() &&
+        std::find(multiSelectedIds_.begin(), multiSelectedIds_.end(), comp.id)
+            != multiSelectedIds_.end();
+    if (!inMulti) {
+        // Single-select this component
+        multiSelectedIds_.clear();
+        selectedCompId_ = comp.id;
+    }
+    selectedWireId_  = -1;
+    movingCompId_    = comp.id;
+    moveStartCanvas_ = pressPt;
+    moveCompOrigPos_ = comp.pos;
+    pushUndo(undoStack_, redoStack_, sch, kMaxUndo);
+    // Store original positions of all selected for multi-move
+    multiMoveOrigPos_.clear();
+    const std::vector<int> toMove = inMulti ? multiSelectedIds_
+                                            : std::vector<int>{comp.id};
+    for (int cid : toMove) {
+        SchematicComp* mc = sch.findComp(cid);
+        if (mc) multiMoveOrigPos_.push_back({cid, mc->pos});
+    }
+    // Store original waypoints for wires fully inside the moved set
+    moveWaypointOrig_.clear();
+    std::unordered_set<int> movedSet;
+    for (auto& [cid, origP] : multiMoveOrigPos_) movedSet.insert(cid);
+    for (auto& w : sch.wires()) {
+        if (!w.waypoints.empty()
+            && movedSet.count(w.fromCompId)
+            && movedSet.count(w.toCompId))
+            moveWaypointOrig_.push_back({w.id, w.waypoints});
+    }
+    // Refresh property buffers
+    if (propEditCompId_ != comp.id) {
+        propEditCompId_ = comp.id;
+        strncpy(propNameBuf_, comp.instanceName.c_str(), sizeof(propNameBuf_)-1);
+        propNameBuf_[sizeof(propNameBuf_)-1] = '\0';
+        for (int i = 0; i < 8; ++i) propBufs_[i][0] = '\0';
+        for (int i = 0; i < (int)comp.paramValues.size() && i < 8; ++i) {
+            strncpy(propBufs_[i], comp.paramValues[i].c_str(), sizeof(propBufs_[i])-1);
+            propBufs_[i][sizeof(propBufs_[i])-1] = '\0';
+        }
+    }
+}
+
 // ── TX_CORE coupling dashes ────────────────────────────────────────────────
 
 void SchematicView::drawTxCoreSymbol(ImDrawList* dl, const SchematicComp& txCore,
@@ -2069,6 +2264,61 @@ void SchematicView::drawCompSymbol(ImDrawList* dl, const SchematicComp& comp,
         dl->AddLine(sc(+18,0), sc(+40,0), col, thick);
         dl->AddLine(sc(+8,0), sc(-8,0), col, thick);
         dl->AddTriangleFilled(sc(-8,0), sc(-4,-4), sc(-4,+4), col);
+    }
+    // ── Controlled sources (VCVS / VCCS): diamond body ────────────────────
+    // Output P on top, N on bottom; single control-sense pin CP on the left
+    // with an open-circle terminal (high-impedance voltage sense vs. GND).
+    else if (id == "VCVS" || id == "VCCS") {
+        // Output leads
+        dl->AddLine(sc(0,-40), sc(0,-16), col, thick);
+        dl->AddLine(sc(0,+16), sc(0,+40), col, thick);
+        // Diamond
+        dl->PathLineTo(sc(0,-16));
+        dl->PathLineTo(sc(+16,0));
+        dl->PathLineTo(sc(0,+16));
+        dl->PathLineTo(sc(-16,0));
+        dl->PathStroke(col, ImDrawFlags_Closed, thick);
+        // Control-sense lead with open terminal
+        dl->AddLine(sc(-40,0), sc(-26,0), col, thick);
+        dl->AddCircle(sc(-23,0), 3.f*z, col, 12, thick*0.8f);
+        // Control polarity "+" above the lead (sense is CP vs. GND)
+        dl->AddLine(sc(-36,-7), sc(-30,-7), col, thick);
+        dl->AddLine(sc(-33,-10), sc(-33,-4), col, thick);
+
+        if (id == "VCVS") {
+            // "+" near P inside the diamond, "−" near N
+            dl->AddLine(sc(-3,-7), sc(+3,-7), col, thick);
+            dl->AddLine(sc(0,-10), sc(0,-4),  col, thick);
+            dl->AddLine(sc(-3,+7), sc(+3,+7), col, thick);
+        } else { // VCCS: current arrow pointing toward P (current exits at P)
+            dl->AddLine(sc(0,+9), sc(0,-4), col, thick);
+            dl->AddTriangleFilled(sc(0,-9), sc(-4,-3), sc(+4,-3), col);
+        }
+    }
+    // ── Op-amp / Comparator: triangle body ────────────────────────────────
+    // IN+ top-left, IN- bottom-left, OUT right (single-ended vs GND).
+    else if (id == "OPAMP" || id == "CMP") {
+        // Triangle
+        dl->PathLineTo(sc(-24,-24));
+        dl->PathLineTo(sc(+24,0));
+        dl->PathLineTo(sc(-24,+24));
+        dl->PathStroke(col, ImDrawFlags_Closed, thick);
+        // Leads
+        dl->AddLine(sc(-40,-20), sc(-24,-20), col, thick);   // IN+
+        dl->AddLine(sc(-40,+20), sc(-24,+20), col, thick);   // IN-
+        dl->AddLine(sc(+24,0),   sc(+40,0),   col, thick);   // OUT
+        // Input polarity inside the triangle
+        dl->AddLine(sc(-20,-20), sc(-12,-20), col, thick);   // "+" horizontal
+        dl->AddLine(sc(-16,-24), sc(-16,-16), col, thick);   // "+" vertical
+        dl->AddLine(sc(-20,+20), sc(-12,+20), col, thick);   // "−"
+        if (id == "CMP") {
+            // Step glyph marks the comparator's 2-state output
+            dl->PathLineTo(sc(-6,+6));
+            dl->PathLineTo(sc(0,+6));
+            dl->PathLineTo(sc(0,-6));
+            dl->PathLineTo(sc(+6,-6));
+            dl->PathStroke(col, 0, thick);
+        }
     }
     // ── Diode ─────────────────────────────────────────────────────────────
     else if (id == "D") {

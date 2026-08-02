@@ -30,7 +30,16 @@ void SettingsView::render(MainViewModel& vm) {
         }
         ImGui::SameLine();
         ImGui::TextDisabled("(= %zu samples)", vm.maxStoredSamples());
-        ImGui::TextDisabled("Multiplied by #signals × #open schematics. Applies to new buffers only.");
+        ImGui::TextDisabled("Multiplied by #signals × #open schematics. Applies on the next Build/Run.");
+        // When a run needs more points than the cap, the simulator subsamples its
+        // output (keeps 1 of every N steps) instead of dropping old data — this
+        // also keeps the scope smooth. Lower the cap for smoother pan/zoom on very
+        // long runs; raise it for more detail when zooming in.
+        int sr = vm.simConfig().sample_ratio;
+        if (sr > 1)
+            ImGui::TextDisabled("Scope decimation active: storing 1 of every %d simulated steps.", sr);
+        else
+            ImGui::TextDisabled("Scope decimation: off (full resolution — run fits within the cap).");
         ImGui::Separator();
     }
 

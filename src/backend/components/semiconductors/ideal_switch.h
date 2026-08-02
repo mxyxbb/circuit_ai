@@ -11,6 +11,10 @@ public:
     std::string name() const override { return name_; }
     int maxNode() const override { return std::max({nd_, ns_, ng_, ngr_}); }
 
+    // POP fundamental detection: expose the gate node so the simulator can trace
+    // it back to the driving source and read its frequency.
+    int gateNode() const override { return ng_; }
+
     void stamp(MNASolver& solver, double, double, size_t) override {
         double r = (state_ == ON)         ? rOn_      :
                    (state_ == BODY_DIODE) ? BODY_R_ON : R_OFF;

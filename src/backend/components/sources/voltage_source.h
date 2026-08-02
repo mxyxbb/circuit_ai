@@ -23,6 +23,9 @@ public:
         return x(extraOff);
     }
 
+    // Source drives its positive terminal (used for gate-frequency tracing).
+    int drivenNode() const override { return np_; }
+
 protected:
     virtual double voltageAt(double t) const { (void)t; return v_; }
 

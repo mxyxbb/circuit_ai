@@ -53,4 +53,17 @@ public:
         (void)t;
         return std::numeric_limits<double>::infinity();
     }
+
+    // ── POP / fundamental-frequency detection ────────────────────────────────
+    // Periodic sources (square wave, sine) report their drive frequency in Hz;
+    // everything else returns 0. Used to identify the FFT fundamental directly
+    // from the user-set frequency property rather than inferring it from data.
+    virtual double driveFrequency() const { return 0.0; }
+    // The node this component actively drives (its positive terminal); -1 if the
+    // component is not a source. Lets the simulator trace a switch gate node back
+    // to the source that drives it.
+    virtual int    drivenNode()    const { return -1; }
+    // Switching devices (MOSFET / ideal switch) report their gate node; -1 for
+    // every other component. Nodes are >= 0 (0 = GND), so >= 0 == "is a switch".
+    virtual int    gateNode()      const { return -1; }
 };

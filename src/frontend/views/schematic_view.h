@@ -68,6 +68,15 @@ private:
     int    ctrlDragCompId_  = -1;
     ImVec2 ctrlDragStart_{0, 0};
 
+    // ── Deferred pin press ───────────────────────────────────────────────────
+    // Mouse-down on a pin arms this instead of starting wiring immediately.
+    // Release without movement → start wiring; drag past the threshold → move
+    // the component (essential for GND/JUNC whose pin covers the whole symbol).
+    bool   pinPendingActive_ = false;
+    int    pinPendingCompId_ = -1;
+    int    pinPendingPinIdx_ = -1;
+    ImVec2 pinPendingStart_{0, 0};
+
     // ── Wire segment dragging (reroute) ──────────────────────────────────────
     int    wireDragId_     = -1;      // wire whose segment was pressed (-1 = none)
     int    wireDragSeg_    = -1;      // segment index in [pinA, wps..., pinB] path
@@ -153,6 +162,10 @@ private:
     // ── Helpers ─────────────────────────────────────────────────────────────
     static const char* polaritySymbol(const std::string& pinLabel);
     static float distPointToSegment(ImVec2 pt, ImVec2 a, ImVec2 b);
+    // Fine-grained component pick: true when pt (canvas units) lies within
+    // `margin` (canvas units) of the component's actual symbol geometry — its
+    // drawn strokes and filled bodies — rather than a coarse bounding box.
+    static bool hitTestCompBody(const struct SchematicComp& comp, ImVec2 pt, float margin);
 
     // ── Sub-renderers ────────────────────────────────────────────────────────
     void handleInput(MainViewModel& vm, bool hovered, ImVec2 origin);
@@ -174,6 +187,13 @@ private:
     void createDocWithComp(MainViewModel& vm, const std::string& typeId, ImVec2 canvasPos);
 
     int  insertJunctionOnWire(struct SchematicModel& sch, int wireId, ImVec2 juncPos);
+    // Select comp (unless already in the multi-selection) and arm the standard
+    // move machinery. pressPt = canvas point where the drag originated.
+    void beginCompMove(struct SchematicModel& sch, struct SchematicComp& comp, ImVec2 pressPt);
+    // Nearest wire segment within maxDist (canvas units) of pt. Returns the
+    // wire id (or -1); *outSnap = grid-snapped closest point on the hit segment.
+    int  hitTestWire(const struct SchematicModel& sch, ImVec2 pt, float maxDist,
+                     ImVec2* outSnap) const;
     static void drawDashedLine(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 col,
                                float thick, float dashLen, float gapLen);
 };

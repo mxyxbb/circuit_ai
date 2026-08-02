@@ -172,6 +172,22 @@ public:
         return s;
     }
 
+    // Pending X-axis zoom request (e.g. POP retention: zoom to the retained
+    // window after trim). Consumed by ScopeView on its next actual render, so
+    // it survives the window being hidden or a background dock tab (where
+    // ScopeView::render early-outs and would miss a same-frame notification).
+    void requestXZoom(double xMin, double xMax) {
+        pendingXZoomMin_ = xMin;
+        pendingXZoomMax_ = xMax;
+        hasPendingXZoom_ = true;
+    }
+    bool hasPendingXZoom() const { return hasPendingXZoom_; }
+    void takePendingXZoom(double& xMin, double& xMax) {
+        xMin = pendingXZoomMin_;
+        xMax = pendingXZoomMax_;
+        hasPendingXZoom_ = false;
+    }
+
     static ImU32 nextColor();
     static void resetColorIndex();
 
@@ -187,5 +203,11 @@ private:
 
     std::string pendingLoadBlock_;
     int         pendingLoadSchId_ = -1;
+
+    // Pending X zoom (see requestXZoom)
+    bool   hasPendingXZoom_  = false;
+    double pendingXZoomMin_  = 0.0;
+    double pendingXZoomMax_  = 0.0;
+
     std::string makePlotTitle(int index);
 };

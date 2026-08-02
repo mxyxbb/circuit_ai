@@ -7,6 +7,7 @@
 #include <functional>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <unordered_map>
 
 // ── Static component type registry ───────────────────────────────────────────
@@ -58,6 +59,31 @@ static const std::vector<CompTypeDef> s_compTypes = {
       { {"P",{-40,0}}, {"N",{40,0}} },
       { {"I (A)", "1m"} },
       {24,14} },
+
+    // Voltage-controlled sources (SPICE E/G). Output pins P/N on top/bottom,
+    // single control-sense pin CP on the left, referenced to GND (netlist
+    // emits NC- = 0). VCVS: V(P,N) = gain*V(CP); VCCS: I into P = gm*V(CP).
+    { "VCVS",     "Controlled V Source", "E",
+      { {"P",{0,-40}}, {"N",{0,40}}, {"CP",{-40,0}} },
+      { {"gain", "1"} },
+      {26,44} },
+
+    { "VCCS",     "Controlled I Source", "G",
+      { {"P",{0,-40}}, {"N",{0,40}}, {"CP",{-40,0}} },
+      { {"gm (S)", "1"} },
+      {26,44} },
+
+    // Op-amp (finite gain + rail clamp) and ideal comparator. Inputs on the
+    // left (IN+ top, IN- bottom), single-ended output on the right (vs GND).
+    { "OPAMP",    "Op-Amp",         "OP",
+      { {"IN+",{-40,-20}}, {"IN-",{-40,20}}, {"OUT",{40,0}} },
+      { {"gain", "100k"}, {"Vmax (V)", "15"}, {"Vmin (V)", "-15"} },
+      {28,28} },
+
+    { "CMP",      "Comparator",     "CMP",
+      { {"IN+",{-40,-20}}, {"IN-",{-40,20}}, {"OUT",{40,0}} },
+      { {"Vhigh (V)", "5"}, {"Vlow (V)", "0"} },
+      {28,28} },
 
     { "D",        "Diode",          "D",
       { {"A",{-40,0}}, {"K",{40,0}} },
@@ -399,6 +425,17 @@ std::string SchematicModel::generateNetlist(const SchematicSimConfig& cfg) const
                 << " tdelay=" << ev(p(2)) << '\n';
         } else if (comp.typeId == "I") {
             oss << n << ' ' << nets[0] << ' ' << nets[1] << " DC " << ev(p(0)) << '\n';
+        } else if (comp.typeId == "VCVS" || comp.typeId == "VCCS") {
+            // E/G: N+ N- NC+ NC- <gain|gm> — control sense referenced to GND
+            oss << n << ' ' << nets[0] << ' ' << nets[1]
+                << ' ' << nets[2] << " 0 " << ev(p(0)) << '\n';
+        } else if (comp.typeId == "OPAMP") {
+            oss << n << ' ' << nets[0] << ' ' << nets[1] << ' ' << nets[2]
+                << " gain=" << ev(p(0)) << " vmax=" << ev(p(1))
+                << " vmin=" << ev(p(2)) << '\n';
+        } else if (comp.typeId == "CMP") {
+            oss << n << ' ' << nets[0] << ' ' << nets[1] << ' ' << nets[2]
+                << " vhigh=" << ev(p(0)) << " vlow=" << ev(p(1)) << '\n';
         } else if (comp.typeId == "D") {
             oss << n << ' ' << nets[0] << ' ' << nets[1] << '\n';
         } else if (comp.typeId == "S") {
@@ -460,6 +497,11 @@ std::string SchematicModel::generateNetlist(const SchematicSimConfig& cfg) const
     }
 
     oss << ".TRAN " << ev(cfg.dt) << ' ' << ev(cfg.tEnd) << '\n';
+    if (cfg.popEnabled) {
+        int n = std::atoi(cfg.popPeriods);
+        if (n < 1) n = 1;
+        oss << ".POP " << n << '\n';
+    }
     // Probe all node voltages
     for (int net : usedNets)
         oss << ".PROBE V(" << net << ")\n";
@@ -476,12 +518,18 @@ std::string SchematicModel::generateNetlist(const SchematicSimConfig& cfg) const
             oss << ".PROBE I(" << comp.instanceName << "_W1)\n";
             oss << ".PROBE I(" << comp.instanceName << "_W2)\n";
         } else if (comp.typeId == "TX_CORE") {
-            if (comp.paramValues.empty()) { oss << ".PROBE I(" << comp.instanceName << ")\n"; continue; }
+            // Mirror the component-emission guard above: a core only produces a
+            // SPICE component (and thus a probeable branch current) when it has a
+            // group AND at least one matching winding. Orphan cores emit nothing,
+            // so probing them references a non-existent component and aborts the
+            // whole build with "PROBE: unknown component <core>".
+            if (comp.paramValues.empty()) continue;
             const std::string& grp = comp.paramValues[0];
             int nWinds = 0;
             for (const auto& wc : comps_)
                 if (wc.typeId == "TX_WIND" && !wc.paramValues.empty() && wc.paramValues[0] == grp)
                     ++nWinds;
+            if (nWinds == 0) continue;
             oss << ".PROBE I(" << comp.instanceName << ")\n";
             for (int w = 1; w < nWinds; ++w)
                 oss << ".PROBE I(" << comp.instanceName << "_W" << w << ")\n";
@@ -507,7 +555,10 @@ bool SchematicModel::saveToFile(const std::string& path) const {
     if (!f) return false;
 
     f << "CSCH3\n";
-    f << "S " << simCfg.dt << ' ' << simCfg.tEnd << '\n';
+    // Trailing pop fields are optional; older loaders that read only dt/tEnd
+    // simply ignore them (backward compatible).
+    f << "S " << simCfg.dt << ' ' << simCfg.tEnd
+      << ' ' << (simCfg.popEnabled ? 1 : 0) << ' ' << simCfg.popPeriods << '\n';
 
     // User variables: "P <name> <expr>" (expr may contain spaces).
     // Older loaders skip unknown tags, so this stays CSCH3-compatible.
@@ -581,6 +632,14 @@ bool SchematicModel::loadFromFile(const std::string& path) {
                 std::strncpy(simCfg.tEnd, tEnd.c_str(), sizeof(simCfg.tEnd) - 1);
                 simCfg.dt  [sizeof(simCfg.dt)   - 1] = '\0';
                 simCfg.tEnd[sizeof(simCfg.tEnd) - 1] = '\0';
+                // Optional POP fields (added later; absent in older files).
+                int popEn = 0;
+                std::string popN;
+                if (ss >> popEn) simCfg.popEnabled = (popEn != 0);
+                if (ss >> popN) {
+                    std::strncpy(simCfg.popPeriods, popN.c_str(), sizeof(simCfg.popPeriods) - 1);
+                    simCfg.popPeriods[sizeof(simCfg.popPeriods) - 1] = '\0';
+                }
             }
         } else if (tag == 'C') {
             SchematicComp c;

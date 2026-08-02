@@ -2,6 +2,7 @@
 #include "circuit/circuit.h"
 #include "components/base_component.h"
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <thread>
 
@@ -90,9 +91,62 @@ bool Simulator::setup(const Circuit& circuit, const SimConfig& config,
         probeMap_.push_back(pme);
     }
 
+    // ── Build POP switch list & resolve each switch's gate-drive frequency ────
+    // A switch reports its gate node via gateNode() (>= 0). The driving source is
+    // the component whose drivenNode() equals that gate node and which advertises
+    // a non-zero driveFrequency() (square wave / sine). This reads the user-set
+    // frequency property directly rather than inferring it from the waveform.
+    popSwitches_.clear();
+    detectedF0_.store(0.0);
+    {
+        const auto& comps = circuit.components();
+        // Circuit-level fallback: the highest gate-drive frequency present. In a
+        // switching converter the switching sources are the highest-frequency
+        // periodic sources (a line/AC input source, if any, is far lower), so this
+        // recovers the switching fundamental when a switch's gate is driven
+        // indirectly (through a gate resistor, comparator, etc.) and can't be
+        // matched to a source by direct node comparison.
+        double fallbackF0 = 0.0;
+        for (const auto& c : comps) {
+            double f = c->driveFrequency();
+            if (f > fallbackF0) fallbackF0 = f;
+        }
+        for (size_t i = 0; i < comps.size(); ++i) {
+            int gate = comps[i]->gateNode();
+            if (gate < 0) continue;  // not a switch
+            PopSwitch ps;
+            ps.compIndex = i;
+            ps.driveFreq = 0.0;
+            // Prefer the source directly wired to this gate (its exact frequency).
+            for (const auto& src : comps) {
+                if (src->drivenNode() == gate) {
+                    double f = src->driveFrequency();
+                    if (f > 0.0) { ps.driveFreq = f; break; }
+                }
+            }
+            if (ps.driveFreq <= 0.0) ps.driveFreq = fallbackF0;  // indirect drive
+            popSwitches_.push_back(ps);
+        }
+    }
+
     t_.store(0.0);
     stepCount_ = 0;
     return true;
+}
+
+// Pick the drive frequency of the switch carrying the largest current among
+// those with a detectable (non-zero) gate-drive frequency. Called on the
+// simulation thread after each step.
+void Simulator::updateDetectedF0() {
+    double bestCurrent = -1.0;
+    double f0 = 0.0;
+    for (const auto& ps : popSwitches_) {
+        if (ps.driveFreq > 0.0 && ps.peakAbsCurrent > bestCurrent) {
+            bestCurrent = ps.peakAbsCurrent;
+            f0          = ps.driveFreq;
+        }
+    }
+    detectedF0_.store(f0);
 }
 
 void Simulator::start() {
@@ -118,6 +172,10 @@ void Simulator::reset() {
     stepCount_ = 0;
     beStepsRemaining_ = 0;
     startedAtEventBoundary_ = false;
+    // Clear POP peak-current tracking; drive frequencies (resolved at setup)
+    // are retained so detection restarts cleanly on the next run.
+    for (auto& ps : popSwitches_) ps.peakAbsCurrent = 0.0;
+    detectedF0_.store(0.0);
     // Reset component internal states (inductor iPrev, capacitor vPrev, etc.)
     if (circuit_) {
         for (const auto& comp : circuit_->components()) {
@@ -352,6 +410,19 @@ bool Simulator::step() {
     }
 
     const auto& x = solver_->lastSolution();
+
+    // POP: track the peak absolute current through each switch and refresh the
+    // detected fundamental. Cheap (a handful of switches), so run every step.
+    if (!popSwitches_.empty()) {
+        const auto& comps = circuit_->components();
+        bool changed = false;
+        for (auto& ps : popSwitches_) {
+            double cur = std::fabs(comps[ps.compIndex]->getBranchCurrent(
+                x, compExtraAbs_[ps.compIndex]));
+            if (cur > ps.peakAbsCurrent) { ps.peakAbsCurrent = cur; changed = true; }
+        }
+        if (changed) updateDetectedF0();
+    }
 
     if (!x.allFinite()) {
         char buf[96];

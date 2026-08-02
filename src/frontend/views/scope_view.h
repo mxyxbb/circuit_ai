@@ -1,6 +1,8 @@
 #pragma once
 #include "views/base_view.h"
+#include "view_model/fft.h"   // fft::Spectrum (cached FFT line)
 #include <vector>
+#include <string>
 #include <iosfwd>
 #include <imgui.h>    // ImVec2
 #include <implot.h>   // ImPlotPoint
@@ -70,11 +72,23 @@ private:
     bool pendingXRestore_ = false;  // if true, apply pendingX* on next tEnd change
     double pendingXMin_   = 0.0;
     double pendingXMax_   = 0.01;
+    // ── CSV export ───────────────────────────────────────────────────────────
+    // Exports every visible signal of this scope (all plots) to a CSV file
+    // chosen via the native save dialog. visibleOnly=true limits rows to the
+    // current X-axis (time) range of the scope window.
+    void exportCsv(MainViewModel& vm, bool visibleOnly);
+
     // ── Rendering ────────────────────────────────────────────────────────────
     void renderPlot(MainViewModel& vm, PlotArea& plot, int plotIndex, float plotHeight, bool isBottom);
     void renderPlotContextMenu(MainViewModel& vm, int plotIndex);
     void renderAddSignalMenu(MainViewModel& vm, int plotIndex);
     void renderRemoveSignalMenu(MainViewModel& vm, int plotIndex);
+
+    // ── FFT / frequency-domain analysis ──────────────────────────────────────
+    // Independent top-level window (one per scope) showing the magnitude
+    // spectrum of the visible signals in the selected plot, computed from the
+    // current visible time range (or all buffered data).
+    void renderFftWindow(MainViewModel& vm);
 
     // ── Data-driven auto-fit (scans visible data, no ImPlot AutoFit flag) ────
     // allData=true  → scan entire buffer (used by Auto-Fit All)
@@ -140,7 +154,57 @@ private:
     bool   cursorActive_ = false;
     double cursorX_      = 0.0;
 
+    // X-axis context menu (right-click on the X-axis strip): editable width of
+    // the visible X range. Seeded with the current width when the menu opens.
+    double xAxisCtxWidth_ = 0.0;
+
     bool   centerOnFirstRender_ = false;
+
+    // ── FFT window state ───────────────────────────────────────────────────────
+    bool   fftOpen_         = false;  // is the FFT window shown
+    int    fftPlotIdx_      = 0;      // which plot's signals to analyse
+    int    fftWindow_       = 0;      // fft::Window enum (0=Rect,1=Hann,2=Hamming,3=Blackman)
+                                      // default Rectangular: with coherent sampling (f0 set,
+                                      // whole periods) no window is needed and Rect gives
+                                      // exact harmonic amplitudes
+    bool   fftDb_           = false;  // magnitude in dB (20·log10) vs linear
+    bool   fftLogX_         = false;  // log10 frequency axis
+    bool   fftRemoveDc_     = true;   // subtract mean before windowing
+    bool   fftVisibleRange_ = true;   // analyse visible time range vs all data
+    double fftF0_           = 0.0;    // user-specified fundamental (Hz); 0 = auto
+    // f0 defaults to the simulator's auto-detected fundamental until the user
+    // edits it. fftF0UserSet_ latches on manual edit so the auto value stops
+    // overriding; fftDetectedF0Applied_ tracks the last detected value pushed in
+    // so a *new* detected fundamental (next run) refreshes the default.
+    bool   fftF0UserSet_        = false;
+    double fftDetectedF0Applied_ = 0.0;
+    int    fftNSel_         = 0;      // index into the N (FFT size) option list; 0 = Auto
+    double fftLastPeakFreq_ = 0.0;    // peak of the first signal last frame (for "f0 = peak")
+    // f0 for which the default X range (first 5 harmonics, [0, 5·f0]) was last
+    // applied. 0 = not applied yet; reset when the FFT window is (re)opened so
+    // the default re-applies. A change of f0 (auto-detect or user edit) also
+    // re-applies the default width.
+    double fftAppliedXF0_   = 0.0;
+    // FFT persistent cursor: snaps to harmonics (k·f0, incl. DC) when f0 is set,
+    // else to the nearest FFT bin. Mirrors the scope's time-domain cursor.
+    bool   fftCursorActive_ = false;
+    double fftCursorFreq_   = 0.0;
+
+    // ── FFT spectrum cache ─────────────────────────────────────────────────────
+    // The magnitude spectrum is expensive (O(N log N) per signal), so it is only
+    // recomputed when the inputs change: a control edit (plot/window/N/f0/dB/range)
+    // recomputes immediately; live sample growth is throttled to ~10 Hz. This is
+    // what keeps the FFT window at full frame rate when the data is static.
+    struct FftLine {
+        std::string         label;
+        ImU32               color = 0;
+        fft::Spectrum       spec;
+        std::vector<double> plotMag;   // linear or dB, ready for ImPlot
+    };
+    std::vector<FftLine> fftLines_;
+    size_t fftCtrlSig_        = 0;     // hash of control params at last compute
+    size_t fftDataSig_        = 0;     // hash of source data at last compute
+    double fftLastComputeTime_ = -1.0; // ImGui time of last recompute (throttle)
 
     // Pending window geometry override (set by setPendingWindowGeometry).
     bool   pendingGeoSet_ = false;

@@ -1,4 +1,33 @@
-rm -rf build/CMakeCache.txt build/CMakeFiles && cmake -B build -G "Visual Studio 17 2022" -A x64 2>&1 | tail -10
-cmake --build build --config Release 2>&1
+怎么编译（教程）
+这个项目用 CMake + MSVC (Visual Studio 生成器)，build/ 目录已经配置好了（存在 build/circuit_ai.sln），所以日常只需要一条命令。
 
-cd "d:/cpp/circuit_ai/proj_re0/build" && cmake --build . --config Debug 2>&1 | grep -iE "error C|: error |fatal" | head -20
+1. 日常编译（最常用）
+在项目根目录 d:\cpp\circuit_ai\proj_re0 下运行：
+
+
+# Release 版
+cmake --build build --config Release --target circuit_ai
+
+# Debug 版
+cmake --build build --config Debug --target circuit_ai
+--config Release/Debug 是关键 —— 这是个 multi-config 生成器，Release/Debug 在同一个 build/ 里，靠这个开关切换，不用重新配置。
+--target circuit_ai 只编主程序（跳过 INSTALL 等无关目标）。省略它会编全部。
+产物路径：
+Release → build\src\app\Release\circuit_ai.exe
+Debug → build\src\app\Debug\circuit_ai.exe
+2. 想多核加速
+
+cmake --build build --config Release --target circuit_ai --parallel
+3. 只有在这些情况才需要「重新配置」
+（改了 CMakeLists.txt、新增/删除了源文件、或 build/ 被删了）
+
+
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+# 然后再 cmake --build build --config Release --target circuit_ai
+注意：这个项目用 vcpkg（vcpkg.json）。首次配置时 CMake 会通过 vcpkg toolchain 拉依赖。既然 build/ 已存在且能编译，说明依赖已就绪，平时不用管。
+
+4. 运行
+
+.\build\src\app\Release\circuit_ai.exe
+一句话记忆
+改代码后 → cmake --build build --config Release --target circuit_ai → 跑 build\src\app\Release\circuit_ai.exe。

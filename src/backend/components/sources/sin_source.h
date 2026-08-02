@@ -14,6 +14,9 @@ protected:
         return voff_ + vampl_ * std::sin(6.283185307179586 * freq_ * t + phase_);
     }
 
+public:
+    double driveFrequency() const override { return freq_; }
+
 private:
     double voff_;    // DC offset (V)
     double vampl_;   // Peak amplitude (V)

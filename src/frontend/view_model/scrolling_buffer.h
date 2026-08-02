@@ -26,6 +26,23 @@ public:
     void clear() { offset_ = 0; count_ = 0; ++generation_; }
     int  generation() const { return generation_; }
 
+    // Drop every sample whose x (time) is below xMin, compacting the survivors to
+    // the front in logical order. Used by POP mode to retain only the last N
+    // fundamental periods after a run completes. Bumps generation() so render-side
+    // caches (FFT, decimation) detect the change.
+    void trimBefore(double xMin) {
+        size_t n = count_;
+        if (n == 0) return;
+        std::vector<double> nx, ny;
+        nx.reserve(n); ny.reserve(n);
+        for (size_t i = 0; i < n; ++i) {
+            double x = getXAt(static_cast<int>(i));
+            if (x >= xMin) { nx.push_back(x); ny.push_back(getYAt(static_cast<int>(i))); }
+        }
+        clear();  // resets offset_/count_, bumps generation_
+        for (size_t i = 0; i < nx.size(); ++i) push(nx[i], ny[i]);
+    }
+
     // For ImPlot: returns pointer to contiguous data.
     // If buffer hasn't wrapped, data is [0..count_).
     // If wrapped, data wraps around offset_.

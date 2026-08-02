@@ -58,6 +58,8 @@ public:
         return ns + duty_ * T;                           // floating-point edge case
     }
 
+    double driveFrequency() const override { return freq_; }
+
 
 private:
     double freq_, duty_, vhigh_, vlow_, tdelay_;

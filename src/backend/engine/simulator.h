@@ -36,6 +36,12 @@ public:
     size_t nodeCount() const { return n_; }
     const std::vector<SignalInfo>& probes() const { return probes_; }
 
+    // Auto-detected fundamental frequency (Hz): the gate-drive frequency of the
+    // switching device carrying the largest current seen so far. 0 when no
+    // switch with a detectable drive frequency exists. Updated live on the
+    // simulation thread; read from any thread.
+    double detectedFundamental() const { return detectedF0_.load(); }
+
     struct ProbeMapEntry {
         enum Kind { NodeVoltage, ExtraCurrent, ResistorCurrent } kind;
         size_t absIndex;      // for NodeVoltage: node-1; for ExtraCurrent: extra var index
@@ -57,6 +63,20 @@ private:
 
     // Absolute matrix index for each component's first extra variable
     std::vector<size_t> compExtraAbs_;
+
+    // ── POP fundamental-frequency detection ──────────────────────────────────
+    // One entry per switching device (IdealSwitch). driveFreq is resolved once
+    // at setup() by tracing the gate node to the source that drives it;
+    // peakAbsCurrent is tracked live during the run. detectedF0_ is the driveFreq
+    // of the largest-current switch that has a non-zero drive frequency.
+    struct PopSwitch {
+        size_t compIndex      = 0;
+        double driveFreq      = 0.0;
+        double peakAbsCurrent = 0.0;
+    };
+    std::vector<PopSwitch> popSwitches_;
+    std::atomic<double>    detectedF0_{0.0};
+    void updateDetectedF0();
 
     size_t n_ = 0;
     size_t m_ = 0;

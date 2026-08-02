@@ -54,6 +54,11 @@ struct SchematicWire {
 struct SchematicSimConfig {
     char dt[32]   = "1e-6";
     char tEnd[32] = "0.01";
+    // POP (Periodic Operating Point): retain only the last popPeriods fundamental
+    // periods of data after the run completes. The fundamental is auto-detected
+    // from the largest-current switch's gate-drive frequency.
+    bool popEnabled     = false;
+    char popPeriods[16] = "5";
 };
 
 // ── User-defined variable (usable in any numeric parameter expression) ───────

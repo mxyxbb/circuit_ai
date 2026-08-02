@@ -1,16 +1,32 @@
 ﻿#include "views/scope_view.h"
 #include "view_model/main_view_model.h"
 #include "view_model/scope_model.h"
+#include "view_model/fft.h"
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <implot.h>
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <functional>
+#include <fstream>
 #include <sstream>
 #include <string>
 #include <unordered_set>
+#include <vector>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <commdlg.h>
+#endif
 
 ScopeView::ScopeView(int scopeIdx)
     : BaseView(scopeIdx == 0 ? "Scope" : "Scope " + std::to_string(scopeIdx)),
@@ -100,7 +116,16 @@ static int decimateCached(
     bool viewChanged   = (c.xMin != xMin) || (c.xMax != xMax) || (c.nBuckets != nBuckets);
     bool countRegress  = (count < c.lastSrcCount);
     bool genChanged    = (c.lastSrcGeneration != generation);
-    bool fullPass      = viewChanged || countRegress || genChanged || wrapped || (c.lastSrcCount < 0);
+    // A wrapped (full) ring buffer normally forces an O(n) re-scan every frame,
+    // because incremental append can't track samples that dropped off the left.
+    // But when the buffer content is identical to last frame — same count, same
+    // offset, same generation (i.e. the sim is paused/finished and no new sample
+    // has been pushed) — the cache is still valid, so we skip the rescan. This is
+    // what removes the idle lag on a scope holding a very large (capacity-full)
+    // buffer, e.g. after a run with a tiny dt.
+    bool contentSame   = (count == c.lastSrcCount) && (offset == c.lastSrcOffset) && !genChanged;
+    bool fullPass      = viewChanged || countRegress || genChanged || (c.lastSrcCount < 0)
+                       || (wrapped && !contentSame);
 
     if (fullPass) {
         c.xMin = xMin; c.xMax = xMax; c.nBuckets = nBuckets;
@@ -386,6 +411,14 @@ void ScopeView::computeAutoFitAll(MainViewModel& vm) {
 
 // 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€ Main render 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 void ScopeView::render(MainViewModel& vm) {
+    // The FFT window is an independent top-level window that MUST be submitted
+    // every frame while open — BEFORE any of the scope window's early returns.
+    // If it were submitted only at the end of render(), then when the FFT and
+    // scope are docked together as tabs, whichever is the background tab fails
+    // to submit (scope's Begin returns false → early return), and the dock node
+    // oscillates its selected tab every frame → high-frequency flicker.
+    if (fftOpen_) renderFftWindow(vm);
+
     if (!visible_) return;
     // Pending geometry from per-sch load takes priority over imgui.ini.
     if (pendingGeoSet_) {
@@ -504,8 +537,31 @@ void ScopeView::render(MainViewModel& vm) {
             } else {
                 xLinkMin_ = 0.0;
                 xLinkMax_ = tEnd;
+                // POP: if the active run's data has been trimmed to the last N
+                // fundamental periods, default to the retained window instead of
+                // the full range. Covers scopes created AFTER the trim (probe-
+                // created / New Scope / recreated after the invisible-scope cull)
+                // which never received a requestXZoom.
+                if (vm.popTrimApplied() && tEnd == vm.simConfig().t_end
+                    && vm.popRetainStart() > 0.0 && vm.popRetainStart() < tEnd)
+                    xLinkMin_ = vm.popRetainStart();
             }
         }
+    }
+
+    // POP trim response: applyPopTrim posted a pending X-zoom on this scope's
+    // model after trimming its data to the last N fundamental periods. Consume
+    // it here — this runs on the scope's next ACTUAL render, so the request
+    // survives the window being hidden or docked as a background tab during the
+    // run (Begin() early-outs above would swallow a same-frame notification).
+    if (scope.hasPendingXZoom()) {
+        double zMin, zMax;
+        scope.takePendingXZoom(zMin, zMax);
+        pushSnapshot(scope.plotCount());
+        xLinkMin_ = zMin;
+        xLinkMax_ = zMax;
+        for (int i = 0; i < scope.plotCount(); i++)
+            computeAutoFitPlot(vm, i, /*allData=*/true);
     }
 
     // Ctrl+Z undo 鈥?only when this window is focused and the user is not typing
@@ -519,12 +575,15 @@ void ScopeView::render(MainViewModel& vm) {
     ensurePlotYStates(scope.plotCount());
 
     // 鈹€鈹€ Toolbar 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-    if (ImGui::Button("+ Plot Above")) {
-        insertPlot(scope, scope.selectedPlot() - 1);
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("+ Plot Below")) {
-        insertPlot(scope, scope.selectedPlot());
+    // Undo — first in the toolbar, shown as a left-arrow button (greyed out when
+    // history is empty). Plot insert/remove now lives only in the right-click menu.
+    {
+        bool hasHistory = !zoomHistory_.empty();
+        if (!hasHistory) ImGui::BeginDisabled();
+        if (ImGui::ArrowButton("##undo", ImGuiDir_Left)) applyUndo();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("Undo zoom / auto-fit  (Ctrl+Z)");
+        if (!hasHistory) ImGui::EndDisabled();
     }
     ImGui::SameLine();
     if (ImGui::Button("Auto-Fit All")) {
@@ -532,16 +591,41 @@ void ScopeView::render(MainViewModel& vm) {
     }
     ImGui::SameLine();
 
-    // Undo (greyed out when history is empty)
+    // Export CSV (greyed out until at least one visible signal has data)
     {
-        bool hasHistory = !zoomHistory_.empty();
-        if (!hasHistory) ImGui::BeginDisabled();
-        if (ImGui::Button("Undo")) applyUndo();
+        bool hasData = false;
+        for (int pi = 0; pi < scope.plotCount() && !hasData; pi++) {
+            const PlotArea* p = scope.getPlot(pi);
+            if (!p) continue;
+            for (const auto& e : p->entries)
+                if (e->visible && e->buffer.getCount() > 0) { hasData = true; break; }
+        }
+        if (!hasData) ImGui::BeginDisabled();
+        if (ImGui::Button("Export CSV"))
+            ImGui::OpenPopup("ExportCsvPopup");
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-            ImGui::SetTooltip("Undo zoom / auto-fit  (Ctrl+Z)");
-        if (!hasHistory) ImGui::EndDisabled();
+            ImGui::SetTooltip("Export all visible signals of this scope to a CSV file");
+        if (!hasData) ImGui::EndDisabled();
+        if (ImGui::BeginPopup("ExportCsvPopup")) {
+            if (ImGui::MenuItem("All data"))
+                exportCsv(vm, /*visibleOnly=*/false);
+            if (ImGui::MenuItem("Visible time range only"))
+                exportCsv(vm, /*visibleOnly=*/true);
+            ImGui::EndPopup();
+        }
     }
     ImGui::SameLine();
+
+    // FFT: opens the frequency-domain window for the currently selected plot.
+    if (ImGui::Button("FFT")) {
+        fftOpen_        = true;
+        fftPlotIdx_     = scope.selectedPlot();
+        fftAppliedXF0_  = 0.0;   // re-apply the default 5·f0 X width on (re)open
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Frequency-domain (FFT) analysis of the selected plot's signals");
+    ImGui::SameLine();
+
     ImGui::TextDisabled("| Sim time: %.6f s", vm.currentTime());
 
     // Source-schematics badge: redundant copy of the title-bar tooltip so the
@@ -992,6 +1076,53 @@ void ScopeView::renderPlot(MainViewModel& vm, PlotArea& plot,
         ImGui::EndPopup();
     }
 
+    // ── X-axis context menu: set the visible X range width ──────────────────
+    // Right-click on the X-axis strip (below the plot body — not covered by
+    // IsPlotHovered, so no conflict with PlotCtx above). The width is applied
+    // anchored to the current RIGHT edge (keeps the latest data in view; with
+    // POP retention that is the retained tail). Applied via pendingZoom_ so the
+    // write happens after EndPlot (linked-axis write-back) with undo support.
+    if (ImPlot::IsAxisHovered(ImAxis_X1) && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+        xAxisCtxWidth_ = xLinkMax_ - xLinkMin_;   // seed with current width
+        ImGui::OpenPopup("XAxisCtx");
+    }
+    if (ImGui::BeginPopup("XAxisCtx")) {
+        auto applyWidth = [&](double w) {
+            if (w > 0.0) {
+                double hi = xLinkMax_, lo = hi - w;
+                if (lo < 0.0) { lo = 0.0; hi = w; }   // clamp to t >= 0
+                pendingZoom_ = {true, /*isH=*/true, lo, hi, plotIndex};
+                ImGui::CloseCurrentPopup();
+            }
+        };
+        ImGui::TextDisabled("X range width (s)");
+        ImGui::SetNextItemWidth(140);
+        bool enter = ImGui::InputDouble("##xwidth", &xAxisCtxWidth_, 0.0, 0.0, "%.6g",
+                                        ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::SameLine();
+        if (ImGui::Button("Apply") || enter) applyWidth(xAxisCtxWidth_);
+
+        // Quick presets: whole fundamental periods (when a switching fundamental
+        // was detected) and the full simulation range.
+        double f0 = vm.detectedFundamental();
+        if (f0 > 0.0) {
+            ImGui::Separator();
+            char lbl[64];
+            for (int k : {1, 2, 5, 10}) {
+                snprintf(lbl, sizeof(lbl), "%d period%s of f0 (%.4g s)",
+                         k, k == 1 ? "" : "s", (double)k / f0);
+                if (ImGui::MenuItem(lbl)) applyWidth((double)k / f0);
+            }
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Full range (0 .. t_end)")) {
+            double tEnd = lastTEnd_ > 0.0 ? lastTEnd_ : vm.simConfig().t_end;
+            pendingZoom_ = {true, /*isH=*/true, 0.0, tEnd, plotIndex};
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
     // 鈹€鈹€ Scale annotation for scaled-scientific axes 鈹€鈹€
     {
         ImDrawList* dl  = ImPlot::GetPlotDrawList();
@@ -1083,6 +1214,11 @@ void ScopeView::renderPlotContextMenu(MainViewModel& vm, int plotIndex) {
             removePlot(scope, plotIndex);
     }
     ImGui::Separator();
+    if (ImGui::MenuItem("FFT Analysis")) {
+        fftOpen_        = true;
+        fftPlotIdx_     = plotIndex;
+        fftAppliedXF0_  = 0.0;   // re-apply the default 5·f0 X width on (re)open
+    }
     if (cursorActive_ && ImGui::MenuItem("Clear Cursor"))
         cursorActive_ = false;
     renderAddSignalMenu(vm, plotIndex);
@@ -1138,6 +1274,535 @@ void ScopeView::renderRemoveSignalMenu(MainViewModel& vm, int plotIndex) {
     }
 
     ImGui::EndMenu();
+}
+
+// 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€ FFT analysis window 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+//
+// Independent top-level window. Recomputes the magnitude spectrum of every
+// visible signal in the selected plot each frame from the buffered samples
+// (cheap: one radix-2 FFT of <=32k points per signal, only while the window is
+// open). Frequency comes from the sample span; the analysis window can be the
+// scope's visible time range or the whole buffer.
+void ScopeView::renderFftWindow(MainViewModel& vm) {
+    // Always submit the window (Begin/End) every frame while open — see the note
+    // in render(). The build-pending / early-out checks happen AFTER Begin so the
+    // window is never skipped, which is what prevents the docked-tab flicker.
+    std::string wtitle = "FFT##" + title_;   // stable per-scope id for dock state
+    ImGui::SetNextWindowSize(ImVec2(660, 430), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin(wtitle.c_str(), &fftOpen_)) {
+        ImGui::End();
+        return;
+    }
+
+    // Skip data access while the circuit rebuilds on the worker thread
+    // (scopes_/entries are in flux), but keep the window submitted.
+    if (vm.isBuildPending()) {
+        ImGui::TextDisabled("  Building circuit...");
+        ImGui::End();
+        return;
+    }
+
+    ScopeModel& scope = vm.scope(scopeIdx_);
+    int pc = scope.plotCount();
+    if (fftPlotIdx_ >= pc) fftPlotIdx_ = pc - 1;
+    if (fftPlotIdx_ < 0)   fftPlotIdx_ = 0;
+
+    // 鈹€鈹€ Toolbar 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // Plot selector
+    {
+        const PlotArea* selP = scope.getPlot(fftPlotIdx_);
+        std::string preview = selP ? selP->title : "Plot";
+        ImGui::SetNextItemWidth(150);
+        if (ImGui::BeginCombo("Source", preview.c_str())) {
+            for (int i = 0; i < pc; i++) {
+                const PlotArea* p = scope.getPlot(i);
+                if (!p) continue;
+                bool sel = (i == fftPlotIdx_);
+                if (ImGui::Selectable(p->title.c_str(), sel)) fftPlotIdx_ = i;
+                if (sel) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+    }
+    ImGui::SameLine();
+    {
+        const char* winNames[] = {"Rectangular", "Hann", "Hamming", "Blackman"};
+        ImGui::SetNextItemWidth(130);
+        ImGui::Combo("Window", &fftWindow_, winNames, IM_ARRAYSIZE(winNames));
+    }
+    ImGui::SameLine();
+    // N (FFT size). "Auto" uses the native sample count (zero-padded to pow2);
+    // an explicit N resamples the window to exactly N points (no padding), which
+    // keeps the fundamental/harmonics exactly on bins when f0 is set.
+    static const int kNOpts[] = {0, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768};
+    {
+        const char* nNames[] = {"Auto", "256", "512", "1024", "2048",
+                                "4096", "8192", "16384", "32768"};
+        ImGui::SetNextItemWidth(90);
+        ImGui::Combo("N", &fftNSel_, nNames, IM_ARRAYSIZE(nNames));
+        if (fftNSel_ < 0) fftNSel_ = 0;
+        if (fftNSel_ >= IM_ARRAYSIZE(kNOpts)) fftNSel_ = IM_ARRAYSIZE(kNOpts) - 1;
+    }
+
+    // Row 2: display options.
+    ImGui::Checkbox("dB", &fftDb_);
+    ImGui::SameLine();
+    ImGui::Checkbox("Log f", &fftLogX_);
+    ImGui::SameLine();
+    ImGui::Checkbox("Remove DC", &fftRemoveDc_);
+    ImGui::SameLine();
+    ImGui::Checkbox("Visible range", &fftVisibleRange_);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "Selects which time span the FFT analyses:\n"
+            "  Checked   : the scope's selected / visible time range [xMin, xMax]\n"
+            "              \xe2\x80\x94 zoom or pan the scope to change the FFT.\n"
+            "  Unchecked : the full simulation range [0, t_end]\n"
+            "              \xe2\x80\x94 fixed; scope zoom/pan does NOT change the FFT.");
+
+    // Row 3: fundamental frequency (coherent sampling) + cursor controls.
+    // Default f0 to the simulator's auto-detected fundamental (the gate-drive
+    // frequency of the largest-current switch) until the user overrides it. A
+    // fresh detected value from a new run refreshes the default.
+    {
+        double det = vm.detectedFundamental();
+        if (det > 0.0 && det != fftDetectedF0Applied_) {
+            fftDetectedF0Applied_ = det;
+            if (!fftF0UserSet_) fftF0_ = det;
+        }
+    }
+    ImGui::SetNextItemWidth(130);
+    if (ImGui::InputDouble("f0 (Hz)", &fftF0_, 0.0, 0.0, "%.6g"))
+        fftF0UserSet_ = true;   // manual edit latches; stop auto-overriding
+    if (fftF0_ < 0.0) fftF0_ = 0.0;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Fundamental frequency. >0 snaps the analysis window to whole\n"
+                          "periods (coherent sampling) and the cursor to harmonics k·f0.\n"
+                          "0 = analyse the whole span.\n"
+                          "Defaults to the auto-detected switching fundamental.");
+    ImGui::SameLine();
+    if (ImGui::Button("f0 = peak") && fftLastPeakFreq_ > 0.0) {
+        fftF0_ = fftLastPeakFreq_;
+        fftF0UserSet_ = true;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Set f0 to the current peak frequency of the first signal");
+    ImGui::SameLine();
+    if (fftCursorActive_) {
+        if (ImGui::Button("Clear Cursor")) fftCursorActive_ = false;
+    } else {
+        ImGui::TextDisabled("(click plot to place cursor)");
+    }
+
+    ImGui::Separator();
+
+    PlotArea* plot = scope.getPlot(fftPlotIdx_);
+    if (!plot) { ImGui::TextDisabled("No plot."); ImGui::End(); return; }
+
+    const double tMin = fftVisibleRange_ ? xLinkMin_ : -DBL_MAX;
+    const double tMax = fftVisibleRange_ ? xLinkMax_ :  DBL_MAX;
+
+    // 鈹€鈹€ Compute spectra 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // Cache signatures: ctrlSig captures every analysis parameter, dataSig the
+    // source buffers (count + generation). A control change recomputes at once; a
+    // pure data change (live simulation) is throttled to avoid per-frame FFTs.
+    auto hashComb = [](size_t& h, size_t v) {
+        h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+    };
+    size_t ctrlSig = 0;
+    hashComb(ctrlSig, std::hash<int>()(fftPlotIdx_));
+    hashComb(ctrlSig, std::hash<int>()(fftWindow_));
+    hashComb(ctrlSig, std::hash<int>()((int)fftRemoveDc_));
+    hashComb(ctrlSig, std::hash<int>()(kNOpts[fftNSel_]));
+    hashComb(ctrlSig, std::hash<double>()(fftF0_));
+    hashComb(ctrlSig, std::hash<int>()((int)fftDb_));
+    hashComb(ctrlSig, std::hash<int>()((int)fftVisibleRange_));
+    if (fftVisibleRange_) {
+        hashComb(ctrlSig, std::hash<double>()(xLinkMin_));
+        hashComb(ctrlSig, std::hash<double>()(xLinkMax_));
+    }
+    size_t dataSig = 0;
+    for (auto& e : plot->entries) {
+        if (!e->visible) continue;
+        hashComb(dataSig, std::hash<std::string>()(e->effectiveLabel()));
+        hashComb(dataSig, std::hash<int>()(e->buffer.getCount()));
+        // offset advances on every push even when the buffer is full (count
+        // pinned at capacity); without it a wrapped/streaming buffer looks
+        // unchanged and the spectrum freezes (most visible with Visible-range
+        // OFF, where the X range never changes to otherwise force a recompute).
+        hashComb(dataSig, std::hash<int>()(e->buffer.getOffset()));
+        hashComb(dataSig, std::hash<int>()(e->buffer.generation()));
+        hashComb(dataSig, std::hash<unsigned>()((unsigned)e->color));
+    }
+
+    const bool ctrlChanged = (ctrlSig != fftCtrlSig_);
+    const bool dataChanged = (dataSig != fftDataSig_);
+    const double nowT = ImGui::GetTime();
+    // Recompute on first use / empty cache, any control change, or a throttled
+    // data change (>=100 ms since the last recompute).
+    const bool recompute = fftLines_.empty() || ctrlChanged
+                        || (dataChanged && (nowT - fftLastComputeTime_) >= 0.1);
+
+    if (recompute) {
+        fftLines_.clear();
+        for (auto& e : plot->entries) {
+            if (!e->visible) continue;
+            int cnt = e->buffer.getCount();
+            if (cnt < 4) continue;
+            std::vector<double> ts, ys;
+            ts.reserve(cnt); ys.reserve(cnt);
+            for (int i = 0; i < cnt; i++) {
+                double x = e->buffer.getXAt(i);
+                if (x < tMin || x > tMax) continue;
+                ts.push_back(x);
+                ys.push_back(e->buffer.getYAt(i));
+            }
+            if ((int)ts.size() < 4) continue;
+
+            fft::Options fo;
+            fo.win      = (fft::Window)fftWindow_;
+            fo.removeDc = fftRemoveDc_;
+            fo.f0       = fftF0_ > 0.0 ? fftF0_ : 0.0;
+            fo.nfft     = kNOpts[fftNSel_];
+            fft::Spectrum sp = fft::compute(ts, ys, fo);
+            if (sp.empty()) continue;
+
+            FftLine fl;
+            fl.label = e->effectiveLabel();
+            fl.color = e->color;
+            fl.plotMag.resize(sp.mag.size());
+            for (size_t k = 0; k < sp.mag.size(); k++) {
+                if (fftDb_) {
+                    double m = sp.mag[k] < 1e-12 ? 1e-12 : sp.mag[k];
+                    fl.plotMag[k] = 20.0 * std::log10(m);
+                } else {
+                    fl.plotMag[k] = sp.mag[k];
+                }
+            }
+            fl.spec = std::move(sp);
+            fftLines_.push_back(std::move(fl));
+        }
+        fftCtrlSig_         = ctrlSig;
+        fftDataSig_         = dataSig;
+        fftLastComputeTime_ = nowT;
+    }
+
+    std::vector<FftLine>& lines = fftLines_;
+    if (lines.empty()) {
+        ImGui::TextDisabled("No signal with enough samples in the selected range.");
+        ImGui::End();
+        return;
+    }
+
+    // 鈹€鈹€ Peak summary 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    auto fmtHz = [](char* b, size_t n, double hz) {
+        if (hz >= 1e6)      std::snprintf(b, n, "%.4g MHz", hz / 1e6);
+        else if (hz >= 1e3) std::snprintf(b, n, "%.4g kHz", hz / 1e3);
+        else                std::snprintf(b, n, "%.4g Hz",  hz);
+    };
+    {
+        const FftLine& l0 = lines.front();
+        fftLastPeakFreq_ = l0.spec.peakFreq;   // for the "f0 = peak" button
+        char pk[48]; fmtHz(pk, sizeof(pk), l0.spec.peakFreq);
+        ImGui::TextDisabled("fs %.4g kHz  |  df %.4g Hz  |  N %d",
+                            l0.spec.fs / 1e3, l0.spec.df, l0.spec.n);
+        ImGui::SameLine();
+        if (l0.spec.periods > 0)
+            ImGui::TextDisabled("|  coherent: %d periods (%.4g ms)",
+                                l0.spec.periods, l0.spec.winDur * 1e3);
+        ImGui::SameLine();
+        ImGui::TextDisabled("|  peak %s (%.4g)", pk, l0.spec.peakMag);
+
+        // Explicit analysis range so it's unambiguous which data the FFT covers
+        // (and why an unchecked "Visible range" stays put when the scope zooms).
+        double rlo, rhi;
+        if (fftVisibleRange_) {
+            rlo = xLinkMin_; rhi = xLinkMax_;
+        } else {
+            rlo = 0.0; rhi = 0.0;
+            for (auto& e : plot->entries)
+                if (e->visible && e->buffer.getCount() > 0) {
+                    rhi = e->buffer.getXAt(e->buffer.getCount() - 1);
+                    break;
+                }
+        }
+        ImGui::TextDisabled("FFT range: %.6g \xe2\x80\x93 %.6g s   (%s)", rlo, rhi,
+                            fftVisibleRange_ ? "selected / visible"
+                                             : "full  0 \xe2\x80\x93 t_end");
+    }
+
+    // Nearest-bin value lookup on a spectrum line at an arbitrary frequency.
+    // Returns the value in the current display units (linear or dB).
+    auto valueAt = [&](const FftLine& fl, double freq) -> double {
+        if (fl.spec.df <= 0.0 || fl.plotMag.empty()) return 0.0;
+        int idx = (int)std::lround(freq / fl.spec.df);
+        if (idx < 0) idx = 0;
+        if (idx >= (int)fl.plotMag.size()) idx = (int)fl.plotMag.size() - 1;
+        return fl.plotMag[idx];
+    };
+    // Snap a clicked/hovered frequency to the point of interest: a harmonic of
+    // f0 (including k=0 = DC) when f0 is set, else the nearest FFT bin.
+    auto snapFreq = [&](double freq) -> double {
+        if (fftF0_ > 0.0) {
+            int k = (int)std::lround(freq / fftF0_);
+            if (k < 0) k = 0;
+            return (double)k * fftF0_;
+        }
+        double df = lines.front().spec.df;
+        if (df <= 0.0) return freq;
+        int idx = (int)std::lround(freq / df);
+        if (idx < 0) idx = 0;
+        return (double)idx * df;
+    };
+
+    // 鈹€鈹€ Plot 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    struct FftHoverVal { std::string lbl; double v; ImU32 col; };
+    bool   hoverShow = false;
+    double hoverF    = 0.0;
+    std::vector<FftHoverVal> hoverVals;
+
+    if (ImPlot::BeginPlot("##fftplot", ImVec2(-1, -1))) {
+        ImPlot::SetupAxis(ImAxis_X1, "Frequency (Hz)");
+        ImPlot::SetupAxis(ImAxis_Y1, fftDb_ ? "Magnitude (dB)" : "Amplitude");
+        if (fftLogX_)
+            ImPlot::SetupAxisScale(ImAxis_X1, ImPlotScale_Log10);
+        // Default X range: the first 5 harmonics ([0, 5·f0]) instead of the full
+        // spectrum. Applied when the window opens with a known fundamental and
+        // re-applied whenever f0 changes (auto-detect fill-in or user edit);
+        // manual pan/zoom afterwards is untouched.
+        if (fftF0_ > 0.0 && fftF0_ != fftAppliedXF0_) {
+            fftAppliedXF0_ = fftF0_;
+            double xlo = fftLogX_ ? fftF0_ * 0.1 : 0.0;   // log axis: 0 is invalid
+            ImPlot::SetupAxisLimits(ImAxis_X1, xlo, 5.0 * fftF0_, ImPlotCond_Always);
+        }
+        ImPlot::SetupLegend(ImPlotLocation_NorthEast);
+
+        for (auto& fl : lines) {
+            ImVec4 col(
+                ((fl.color >> 0)  & 0xFF) / 255.0f,
+                ((fl.color >> 8)  & 0xFF) / 255.0f,
+                ((fl.color >> 16) & 0xFF) / 255.0f,
+                1.0f);
+            ImPlotSpec spec(ImPlotProp_LineColor, col, ImPlotProp_LineWeight, 1.5f);
+            // On a log-X axis skip the DC bin (freq 0 is invalid for log10).
+            int start = fftLogX_ ? 1 : 0;
+            int n = (int)fl.spec.freq.size() - start;
+            if (n > 0)
+                ImPlot::PlotLine(fl.label.c_str(),
+                                 fl.spec.freq.data() + start,
+                                 fl.plotMag.data() + start, n, spec);
+        }
+
+        ImDrawList* dl   = ImPlot::GetPlotDrawList();
+        ImVec2      pPos = ImPlot::GetPlotPos();
+        ImVec2      pSize= ImPlot::GetPlotSize();
+        ImPlotRect  lim  = ImPlot::GetPlotLimits();
+
+        // 鈹€鈹€ Harmonic reference lines at k路f0 (the frequencies of interest) 鈹€鈹€鈹€鈹€
+        if (fftF0_ > 0.0) {
+            int kStart = std::max(1, (int)std::floor(lim.X.Min / fftF0_));
+            int kEnd   = (int)std::ceil(lim.X.Max / fftF0_);
+            if (kEnd - kStart > 256) kEnd = kStart + 256;   // clutter cap
+            for (int k = kStart; k <= kEnd; ++k) {
+                double fx = (double)k * fftF0_;
+                ImVec2 p = ImPlot::PlotToPixels(fx, 0.0);
+                if (p.x < pPos.x || p.x > pPos.x + pSize.x) continue;
+                dl->AddLine({p.x, pPos.y}, {p.x, pPos.y + pSize.y},
+                            IM_COL32(120, 120, 120, 70), 1.0f);
+            }
+        }
+
+        bool plotHov = ImPlot::IsPlotHovered();
+
+        // 鈹€鈹€ Place / clear cursor 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        // Left click (press+release without a real drag) places the cursor;
+        // right click clears it. ImPlot keeps native pan on left-drag.
+        if (plotHov && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+            ImVec2 dd = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left);
+            if (std::fabs(dd.x) + std::fabs(dd.y) < 4.0f) {
+                fftCursorFreq_   = snapFreq(ImPlot::GetPlotMousePos().x);
+                fftCursorActive_ = true;
+            }
+        }
+        if (plotHov && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+            fftCursorActive_ = false;
+
+        // 鈹€鈹€ Hover crosshair 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        if (plotHov) {
+            double snap = snapFreq(ImPlot::GetPlotMousePos().x);
+            ImVec2 px = ImPlot::PlotToPixels(snap, 0.0);
+            const float kDash = 6.0f, kGap = 4.0f;
+            for (float y = pPos.y; y < pPos.y + pSize.y; y += kDash + kGap) {
+                float yEnd = std::min(y + kDash, pPos.y + pSize.y);
+                dl->AddLine({px.x, y}, {px.x, yEnd}, IM_COL32(200, 200, 200, 120), 1.0f);
+            }
+            hoverShow = true;
+            hoverF    = snap;
+            for (auto& fl : lines)
+                hoverVals.push_back({fl.label, valueAt(fl, snap), fl.color});
+        }
+
+        // 鈹€鈹€ Persistent cursor: yellow line + value labels 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        if (fftCursorActive_) {
+            ImVec2 cpx = ImPlot::PlotToPixels(fftCursorFreq_, 0.0);
+            if (cpx.x >= pPos.x - 1.0f && cpx.x <= pPos.x + pSize.x + 1.0f) {
+                float cx = std::max(cpx.x, pPos.x);
+                dl->AddLine({cx, pPos.y}, {cx, pPos.y + pSize.y},
+                            IM_COL32(255, 220, 50, 230), 1.5f);
+                // Header: frequency + harmonic index (h0 = DC).
+                char hdr[64];
+                char fbuf[48]; fmtHz(fbuf, sizeof(fbuf), fftCursorFreq_);
+                if (fftF0_ > 0.0) {
+                    int k = (int)std::lround(fftCursorFreq_ / fftF0_);
+                    if (k == 0) std::snprintf(hdr, sizeof(hdr), "%s  DC", fbuf);
+                    else        std::snprintf(hdr, sizeof(hdr), "%s  h%d", fbuf, k);
+                } else {
+                    std::snprintf(hdr, sizeof(hdr), "%s", fbuf);
+                }
+                float yOff = pPos.y + 4.0f;
+                auto drawLabel = [&](const char* txt, ImU32 col) {
+                    ImVec2 ts = ImGui::CalcTextSize(txt);
+                    float tx = std::min(cx + 3.0f, pPos.x + pSize.x - ts.x - 2.0f);
+                    dl->AddRectFilled({tx - 1, yOff - 1}, {tx + ts.x + 1, yOff + ts.y + 1},
+                                      IM_COL32(20, 20, 20, 190));
+                    dl->AddText({tx, yOff}, col, txt);
+                    yOff += ts.y + 2.0f;
+                };
+                drawLabel(hdr, IM_COL32(255, 220, 50, 255));
+                for (auto& fl : lines) {
+                    char txt[96];
+                    std::snprintf(txt, sizeof(txt), "%s=%.4g%s",
+                                  fl.label.c_str(), valueAt(fl, fftCursorFreq_),
+                                  fftDb_ ? "dB" : "");
+                    drawLabel(txt, fl.color);
+                }
+            }
+        }
+
+        ImPlot::EndPlot();
+    }
+
+    // Hover tooltip (after EndPlot so it doesn't disturb IsPlotHovered).
+    if (hoverShow && ImGui::BeginTooltip()) {
+        char fbuf[48]; fmtHz(fbuf, sizeof(fbuf), hoverF);
+        if (fftF0_ > 0.0) {
+            int k = (int)std::lround(hoverF / fftF0_);
+            if (k == 0) ImGui::Text("f = %s  (DC)", fbuf);
+            else        ImGui::Text("f = %s  (h%d)", fbuf, k);
+        } else {
+            ImGui::Text("f = %s", fbuf);
+        }
+        for (const auto& hv : hoverVals) {
+            float r = ((hv.col >> 0)  & 0xFF) / 255.0f;
+            float g = ((hv.col >> 8)  & 0xFF) / 255.0f;
+            float b = ((hv.col >> 16) & 0xFF) / 255.0f;
+            ImGui::ColorButton("##cv", ImVec4(r, g, b, 1.0f),
+                ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoBorder,
+                ImVec2(10.0f, 10.0f));
+            ImGui::SameLine();
+            ImGui::Text("%s = %.4g%s", hv.lbl.c_str(), hv.v, fftDb_ ? "dB" : "");
+        }
+        ImGui::EndTooltip();
+    }
+
+    ImGui::End();
+}
+
+// ─────────────────────── CSV export ──────────────────────────────────────────
+//
+// Exports every visible signal across all plots of this scope. The time column
+// comes from the entry with the most samples; all signals produced by one
+// simulation run share the same time base, so values line up exactly. Signals
+// from a different run (mixed-source scope) are matched by nearest sample time
+// — the same snapping the hover crosshair uses.
+
+#ifdef _WIN32
+static bool pickCsvSavePath(char* buf, int n) {
+    OPENFILENAMEA ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.lpstrFilter = "CSV (comma separated)\0*.csv\0All Files\0*.*\0\0";
+    ofn.lpstrFile   = buf;
+    ofn.nMaxFile    = static_cast<DWORD>(n);
+    ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR;
+    ofn.lpstrDefExt = "csv";
+    buf[0] = '\0';
+    return GetSaveFileNameA(&ofn) != 0;
+}
+#endif
+
+void ScopeView::exportCsv(MainViewModel& vm, bool visibleOnly) {
+    ScopeModel& scope = vm.scope(scopeIdx_);
+
+    // Collect visible entries that actually hold data, in plot order.
+    std::vector<const MuxEntry*> entries;
+    for (int pi = 0; pi < scope.plotCount(); pi++) {
+        const PlotArea* p = scope.getPlot(pi);
+        if (!p) continue;
+        for (const auto& e : p->entries)
+            if (e->visible && e->buffer.getCount() > 0)
+                entries.push_back(e.get());
+    }
+    if (entries.empty()) return;
+
+    char path[1024];
+#ifdef _WIN32
+    if (!pickCsvSavePath(path, sizeof(path))) return;  // user cancelled
+#else
+    std::snprintf(path, sizeof(path), "scope_export.csv");
+#endif
+
+    std::ofstream f(path);
+    if (!f) return;
+
+    // Quote fields containing separators so labels like "a,b" stay one column.
+    auto csvField = [](const std::string& s) -> std::string {
+        if (s.find_first_of(",\"\n") == std::string::npos) return s;
+        std::string q = "\"";
+        for (char c : s) { if (c == '"') q += '"'; q += c; }
+        q += '"';
+        return q;
+    };
+    f << "time";
+    for (const auto* e : entries) f << ',' << csvField(e->effectiveLabel());
+    f << '\n';
+
+    // Master time base: the entry with the most samples.
+    const MuxEntry* master = entries[0];
+    for (const auto* e : entries)
+        if (e->buffer.getCount() > master->buffer.getCount()) master = e;
+
+    // Nearest-sample lookup over logical ring-buffer indices (X is sorted).
+    auto nearestY = [](const ScrollingBuffer& buf, double t) -> double {
+        int n = buf.getCount();
+        int lo = 0, hi = n - 1;
+        while (lo < hi) {
+            int mid = (lo + hi) / 2;
+            if (buf.getXAt(mid) < t) lo = mid + 1;
+            else                     hi = mid;
+        }
+        if (lo > 0) {
+            double d0 = std::abs(buf.getXAt(lo - 1) - t);
+            double d1 = std::abs(buf.getXAt(lo)     - t);
+            if (d0 < d1) lo--;
+        }
+        return buf.getYAt(lo);
+    };
+
+    char num[40];
+    int rows = master->buffer.getCount();
+    for (int r = 0; r < rows; r++) {
+        double t = master->buffer.getXAt(r);
+        if (visibleOnly && (t < xLinkMin_ || t > xLinkMax_)) continue;
+        std::snprintf(num, sizeof(num), "%.9g", t);
+        f << num;
+        for (const auto* e : entries) {
+            double y = (e == master) ? e->buffer.getYAt(r)
+                                     : nearestY(e->buffer, t);
+            std::snprintf(num, sizeof(num), "%.9g", y);
+            f << ',' << num;
+        }
+        f << '\n';
+    }
 }
 
 // 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€ Scope state persistence 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€

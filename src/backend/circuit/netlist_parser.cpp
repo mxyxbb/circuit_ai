@@ -8,6 +8,10 @@
 #include "components/sources/square_wave_source.h"
 #include "components/sources/step_source.h"
 #include "components/sources/sin_source.h"
+#include "components/sources/vcvs.h"
+#include "components/sources/vccs.h"
+#include "components/active/op_amp.h"
+#include "components/active/comparator.h"
 #include "components/semiconductors/ideal_diode.h"
 #include "components/semiconductors/ideal_switch.h"
 #include "common/expr_eval.h"
@@ -154,6 +158,16 @@ bool NetlistParser::processLine(const std::string& line, ParseResult& result) {
             result.config.t_end = parseValue(tokens[2]);
             return true;
         }
+        if (first == ".POP") {
+            // .POP <N>  — enable Periodic Operating Point retention: keep only the
+            // last N fundamental-frequency periods before t_end.
+            result.config.pop_enabled = true;
+            if (tokens.size() >= 2) {
+                int n = static_cast<int>(parseValue(tokens[1]));
+                if (n >= 1) result.config.pop_periods = n;
+            }
+            return true;
+        }
         if (first == ".PROBE") {
             for (size_t i = 1; i < tokens.size(); i++) {
                 if (!parseProbe(tokens[i], result)) return false;
@@ -198,10 +212,39 @@ bool NetlistParser::processLine(const std::string& line, ParseResult& result) {
             return true;
         }
         case 'C': case 'c': {
+            // CMP<name> — ideal comparator: IN+ IN- OUT [vhigh=<v>] [vlow=<v>]
+            if (first.size() >= 3 && first.compare(0, 3, "CMP") == 0) {
+                if (tokens.size() < 4) { result.error = "CMP: need IN+ IN- OUT"; return false; }
+                int inp = std::stoi(tokens[1]), inn = std::stoi(tokens[2]);
+                int out = std::stoi(tokens[3]);
+                double vhigh = 5.0, vlow = 0.0;
+                for (size_t i = 4; i < tokens.size(); i++) {
+                    std::string p = toUpper(tokens[i]);
+                    if (p.find("VHIGH=") == 0) vhigh = parseValue(p.substr(6));
+                    else if (p.find("VLOW=") == 0) vlow = parseValue(p.substr(5));
+                }
+                result.circuit.addComponent(std::make_unique<Comparator>(name, inp, inn, out, vhigh, vlow));
+                return true;
+            }
             if (tokens.size() < 4) { result.error = "C: need N+ N- value"; return false; }
             int np = std::stoi(tokens[1]), nn = std::stoi(tokens[2]);
             double c = parseValue(tokens[3]);
             result.circuit.addComponent(std::make_unique<Capacitor>(name, np, nn, c));
+            return true;
+        }
+        case 'O': case 'o': {
+            // OP<name> — op-amp: IN+ IN- OUT [gain=<A>] [vmax=<v>] [vmin=<v>]
+            if (tokens.size() < 4) { result.error = "OP: need IN+ IN- OUT"; return false; }
+            int inp = std::stoi(tokens[1]), inn = std::stoi(tokens[2]);
+            int out = std::stoi(tokens[3]);
+            double gain = 1e5, vmax = 15.0, vmin = -15.0;
+            for (size_t i = 4; i < tokens.size(); i++) {
+                std::string p = toUpper(tokens[i]);
+                if (p.find("GAIN=") == 0) gain = parseValue(p.substr(5));
+                else if (p.find("VMAX=") == 0) vmax = parseValue(p.substr(5));
+                else if (p.find("VMIN=") == 0) vmin = parseValue(p.substr(5));
+            }
+            result.circuit.addComponent(std::make_unique<OpAmp>(name, inp, inn, out, gain, vmax, vmin));
             return true;
         }
         case 'L': case 'l': {
@@ -260,6 +303,24 @@ bool NetlistParser::processLine(const std::string& line, ParseResult& result) {
             int np = std::stoi(tokens[1]), nn = std::stoi(tokens[2]);
             double i = parseValue(tokens[4]);
             result.circuit.addComponent(std::make_unique<CurrentSource>(name, np, nn, i));
+            return true;
+        }
+        case 'E': case 'e': {
+            // VCVS: E<name> N+ N- NC+ NC- <gain>
+            if (tokens.size() < 6) { result.error = "E: need N+ N- NC+ NC- gain"; return false; }
+            int np  = std::stoi(tokens[1]), nn  = std::stoi(tokens[2]);
+            int ncp = std::stoi(tokens[3]), ncn = std::stoi(tokens[4]);
+            double gain = parseValue(tokens[5]);
+            result.circuit.addComponent(std::make_unique<VCVS>(name, np, nn, ncp, ncn, gain));
+            return true;
+        }
+        case 'G': case 'g': {
+            // VCCS: G<name> N+ N- NC+ NC- <gm>
+            if (tokens.size() < 6) { result.error = "G: need N+ N- NC+ NC- gm"; return false; }
+            int np  = std::stoi(tokens[1]), nn  = std::stoi(tokens[2]);
+            int ncp = std::stoi(tokens[3]), ncn = std::stoi(tokens[4]);
+            double gm = parseValue(tokens[5]);
+            result.circuit.addComponent(std::make_unique<VCCS>(name, np, nn, ncp, ncn, gm));
             return true;
         }
         case 'D': case 'd': {
